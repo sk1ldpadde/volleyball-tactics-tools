@@ -4,9 +4,11 @@ from pathlib import Path
 import cv2
 import numpy as np
 import supervision as sv
+import pytest
 
 from examples.volleyball.pipeline import PipelineOptions, run_pipeline
 from sports.common.calibration import CourtCalibration
+from sports.configs.volleyball import CameraView
 
 
 class _FixedDetector:
@@ -37,21 +39,35 @@ def _probe(path: Path):
         return (
             int(capture.get(cv2.CAP_PROP_FRAME_COUNT)),
             float(capture.get(cv2.CAP_PROP_FPS)),
+            int(capture.get(cv2.CAP_PROP_FRAME_WIDTH)),
+            int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT)),
         )
     finally:
         capture.release()
 
 
-def test_synthetic_video_runs_through_complete_pipeline(tmp_path) -> None:
+@pytest.mark.parametrize(
+    ("camera_view", "tactical_resolution"),
+    [
+        (CameraView.ENDLINE, (240, 360)),
+        (CameraView.SIDELINE, (360, 240)),
+    ],
+)
+def test_synthetic_video_runs_through_complete_pipeline(
+    tmp_path, camera_view, tactical_resolution,
+) -> None:
     source = tmp_path / "source.mp4"
     output = tmp_path / "output"
     _write_video(source)
-    calibration = CourtCalibration(landmarks={
-        "far_left_corner": (40.0, 30.0),
-        "far_right_corner": (280.0, 30.0),
-        "near_right_corner": (280.0, 210.0),
-        "near_left_corner": (40.0, 210.0),
-    })
+    calibration = CourtCalibration(
+        landmarks={
+            "far_left_corner": (40.0, 30.0),
+            "far_right_corner": (280.0, 30.0),
+            "near_right_corner": (280.0, 210.0),
+            "near_left_corner": (40.0, 210.0),
+        },
+        camera_view=camera_view,
+    )
 
     written = run_pipeline(
         source_video=source,
@@ -61,16 +77,19 @@ def test_synthetic_video_runs_through_complete_pipeline(tmp_path) -> None:
         config=calibration.configuration(),
         options=PipelineOptions(
             max_frames=5,
-            tactical_resolution=(240, 360),
+            tactical_resolution=tactical_resolution,
             tactical_padding=20,
+            camera_view=camera_view,
         ),
     )
 
     assert written == 5
     for filename in ("annotated.mp4", "tactical.mp4", "combined.mp4"):
-        frame_count, fps = _probe(output / filename)
+        frame_count, fps, width, height = _probe(output / filename)
         assert frame_count == 5
         assert fps == 12.0
+        if filename == "tactical.mp4":
+            assert (width, height) == tactical_resolution
     with (output / "player_tracks.csv").open(newline="", encoding="utf-8") as stream:
         rows = list(csv.DictReader(stream))
     assert rows

@@ -1,10 +1,26 @@
 """Metric geometry for an indoor volleyball court."""
 
 from dataclasses import dataclass
+from enum import Enum
 from typing import Dict, List, Tuple
 
 
 Point = Tuple[float, float]
+
+
+class CameraView(str, Enum):
+    """How the camera is positioned relative to the canonical court."""
+
+    ENDLINE = "endline"
+    SIDELINE = "sideline"
+
+
+def default_tactical_resolution(camera_view: CameraView) -> Tuple[int, int]:
+    """Return a court-shaped canvas for the requested display orientation."""
+    camera_view = CameraView(camera_view)
+    if camera_view is CameraView.SIDELINE:
+        return (900, 450)
+    return (450, 900)
 
 
 @dataclass(frozen=True)

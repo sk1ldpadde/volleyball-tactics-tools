@@ -14,7 +14,7 @@ import supervision as sv
 from sports.annotators.volleyball import draw_player_tracks_on_volleyball_court
 from sports.common.calibration import CourtCalibration
 from sports.common.view import get_bottom_center_points
-from sports.configs.volleyball import Point, VolleyballCourtConfiguration
+from sports.configs.volleyball import CameraView, Point, VolleyballCourtConfiguration
 
 try:
     from .calibration import draw_projected_court
@@ -48,12 +48,13 @@ class PipelineOptions:
     start_time: float = 0.0
     end_time: Optional[float] = None
     max_frames: Optional[int] = None
-    tactical_resolution: Tuple[int, int] = (600, 900)
+    tactical_resolution: Tuple[int, int] = (450, 900)
     tactical_padding: int = 40
     trajectory_length: int = 30
     show_detections: bool = True
     show_track_ids: bool = True
     preview_tactical_view: bool = False
+    camera_view: CameraView = CameraView.ENDLINE
 
 
 def _video_writer(path: Path, fps: float, size: Tuple[int, int]) -> cv2.VideoWriter:
@@ -89,12 +90,32 @@ def _annotate_source(
     return annotated
 
 
+def _combined_tactical_size(
+    source_size: Tuple[int, int], tactical_size: Tuple[int, int],
+) -> Tuple[int, int]:
+    """Fit a tactical panel beside the source without distorting or dominating it."""
+    source_width, source_height = source_size
+    tactical_width, tactical_height = tactical_size
+    scale = min(
+        source_height / tactical_height,
+        (source_width * 0.6) / tactical_width,
+    )
+    return (
+        max(1, int(round(tactical_width * scale))),
+        max(1, int(round(tactical_height * scale))),
+    )
+
+
 def _combine_frames(source: np.ndarray, tactical: np.ndarray) -> np.ndarray:
     source_height = source.shape[0]
-    tactical_width = max(1, int(round(tactical.shape[1] * source_height / tactical.shape[0])))
+    tactical_width, tactical_height = _combined_tactical_size(
+        (source.shape[1], source_height), (tactical.shape[1], tactical.shape[0]))
     resized_tactical = cv2.resize(
-        tactical, (tactical_width, source_height), interpolation=cv2.INTER_AREA)
-    return np.hstack((source, resized_tactical))
+        tactical, (tactical_width, tactical_height), interpolation=cv2.INTER_AREA)
+    panel = np.zeros((source_height, tactical_width, 3), dtype=np.uint8)
+    top = (source_height - tactical_height) // 2
+    panel[top:top + tactical_height] = resized_tactical
+    return np.hstack((source, panel))
 
 
 def run_pipeline(
@@ -106,6 +127,11 @@ def run_pipeline(
     options: PipelineOptions,
 ) -> int:
     """Process a video stream and return the number of written frames."""
+    if CameraView(options.camera_view) is not calibration.camera_view:
+        raise ValueError(
+            "Pipeline camera view does not match the saved calibration: "
+            f"{CameraView(options.camera_view).value} != {calibration.camera_view.value}."
+        )
     output_dir.mkdir(parents=True, exist_ok=True)
     capture = cv2.VideoCapture(str(source_video))
     if not capture.isOpened():
@@ -121,8 +147,8 @@ def run_pipeline(
     first_frame_index = max(0, int(round(options.start_time * fps)))
     capture.set(cv2.CAP_PROP_POS_FRAMES, first_frame_index)
     tactical_size = options.tactical_resolution
-    combined_tactical_width = max(
-        1, int(round(tactical_size[0] * frame_height / tactical_size[1])))
+    combined_tactical_width, _ = _combined_tactical_size(
+        (frame_width, frame_height), tactical_size)
     writers = []
     try:
         writers.append(_video_writer(
@@ -218,6 +244,7 @@ def run_pipeline(
                     resolution_wh=tactical_size,
                     padding=options.tactical_padding,
                     include_free_zone=True,
+                    camera_view=options.camera_view,
                 )
                 combined = _combine_frames(annotated, tactical)
                 writers[0].write(annotated)

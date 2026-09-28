@@ -5,7 +5,12 @@ from typing import Mapping, Optional, Sequence, Tuple
 import cv2
 import numpy as np
 
-from sports.configs.volleyball import Point, VolleyballCourtConfiguration
+from sports.configs.volleyball import (
+    CameraView,
+    Point,
+    VolleyballCourtConfiguration,
+    default_tactical_resolution,
+)
 
 
 Color = Tuple[int, int, int]
@@ -15,17 +20,21 @@ Resolution = Tuple[int, int]
 def court_to_canvas(
     config: VolleyballCourtConfiguration,
     points: np.ndarray,
-    resolution_wh: Resolution = (600, 900),
+    resolution_wh: Optional[Resolution] = None,
     padding: int = 40,
     include_free_zone: bool = True,
+    camera_view: CameraView = CameraView.ENDLINE,
 ) -> np.ndarray:
-    """Convert metric court coordinates to tactical-canvas pixels."""
+    """Convert canonical metric coordinates to orientation-specific canvas pixels."""
     points = np.asarray(points, dtype=np.float32)
     if points.size == 0:
         return points.reshape(-1, 2)
     if points.ndim != 2 or points.shape[1] != 2:
         raise ValueError("points must be an Nx2 array")
 
+    camera_view = CameraView(camera_view)
+    if resolution_wh is None:
+        resolution_wh = default_tactical_resolution(camera_view)
     canvas_width, canvas_height = resolution_wh
     side_margin = config.side_margin if include_free_zone else 0.0
     baseline_margin = config.baseline_margin if include_free_zone else 0.0
@@ -34,23 +43,32 @@ def court_to_canvas(
     if available_width <= 0 or available_height <= 0:
         raise ValueError("resolution must be larger than twice the padding")
 
-    world_width = config.width + 2 * side_margin
-    world_height = config.length + 2 * baseline_margin
+    if camera_view is CameraView.ENDLINE:
+        oriented_points = points
+        world_width = config.width + 2 * side_margin
+        world_height = config.length + 2 * baseline_margin
+        minimum_x, minimum_y = -side_margin, -baseline_margin
+    else:
+        # Clockwise display rotation only: canonical metres remain unchanged.
+        oriented_points = np.column_stack((points[:, 1], config.width - points[:, 0]))
+        world_width = config.length + 2 * baseline_margin
+        world_height = config.width + 2 * side_margin
+        minimum_x, minimum_y = -baseline_margin, -side_margin
     scale = min(available_width / world_width, available_height / world_height)
     rendered_width = world_width * scale
     rendered_height = world_height * scale
-    origin_x = (canvas_width - rendered_width) / 2.0 + side_margin * scale
-    origin_y = (canvas_height - rendered_height) / 2.0 + baseline_margin * scale
+    origin_x = (canvas_width - rendered_width) / 2.0 - minimum_x * scale
+    origin_y = (canvas_height - rendered_height) / 2.0 - minimum_y * scale
 
     canvas_points = np.empty_like(points, dtype=np.float32)
-    canvas_points[:, 0] = origin_x + points[:, 0] * scale
-    canvas_points[:, 1] = origin_y + points[:, 1] * scale
+    canvas_points[:, 0] = origin_x + oriented_points[:, 0] * scale
+    canvas_points[:, 1] = origin_y + oriented_points[:, 1] * scale
     return canvas_points
 
 
 def draw_volleyball_court(
     config: VolleyballCourtConfiguration,
-    resolution_wh: Resolution = (600, 900),
+    resolution_wh: Optional[Resolution] = None,
     padding: int = 40,
     include_free_zone: bool = True,
     background_color: Color = (36, 94, 58),
@@ -59,8 +77,12 @@ def draw_volleyball_court(
     line_color: Color = (255, 255, 255),
     net_color: Color = (35, 35, 35),
     line_thickness: int = 3,
+    camera_view: CameraView = CameraView.ENDLINE,
 ) -> np.ndarray:
     """Render the full playing court, center line, and both attack lines."""
+    camera_view = CameraView(camera_view)
+    if resolution_wh is None:
+        resolution_wh = default_tactical_resolution(camera_view)
     width, height = resolution_wh
     if width <= 0 or height <= 0:
         raise ValueError("resolution dimensions must be positive")
@@ -74,14 +96,18 @@ def draw_volleyball_court(
             ],
             dtype=np.float32,
         )
-        p1, p2 = np.rint(court_to_canvas(
-            config, extended, resolution_wh, padding, include_free_zone=True
+        free_zone_pixels = np.rint(court_to_canvas(
+            config, extended, resolution_wh, padding, include_free_zone=True,
+            camera_view=camera_view,
         )).astype(int)
+        p1 = np.min(free_zone_pixels, axis=0)
+        p2 = np.max(free_zone_pixels, axis=0)
         cv2.rectangle(image, tuple(p1), tuple(p2), free_zone_color, thickness=-1)
 
     corners = np.asarray(config.corner_points, dtype=np.float32)
     canvas_corners = np.rint(court_to_canvas(
-        config, corners, resolution_wh, padding, include_free_zone
+        config, corners, resolution_wh, padding, include_free_zone,
+        camera_view=camera_view,
     )).astype(int)
     cv2.fillConvexPoly(image, canvas_corners, court_color)
     cv2.polylines(image, [canvas_corners], True, line_color, line_thickness)
@@ -98,6 +124,7 @@ def draw_volleyball_court(
             resolution_wh,
             padding,
             include_free_zone,
+            camera_view=camera_view,
         )
         start, end = np.rint(endpoints).astype(int)
         cv2.line(image, tuple(start), tuple(end), color, thickness)
@@ -109,19 +136,22 @@ def draw_points_on_volleyball_court(
     points: np.ndarray,
     labels: Optional[Sequence[str]] = None,
     court: Optional[np.ndarray] = None,
-    resolution_wh: Resolution = (600, 900),
+    resolution_wh: Optional[Resolution] = None,
     padding: int = 40,
     include_free_zone: bool = True,
     face_color: Color = (30, 30, 230),
     edge_color: Color = (255, 255, 255),
     radius: int = 9,
+    camera_view: CameraView = CameraView.ENDLINE,
 ) -> np.ndarray:
     """Draw metric points and optional labels on a tactical court."""
     if court is None:
         court = draw_volleyball_court(
-            config, resolution_wh, padding, include_free_zone)
+            config, resolution_wh, padding, include_free_zone,
+            camera_view=camera_view)
     canvas_points = court_to_canvas(
-        config, points, resolution_wh, padding, include_free_zone)
+        config, points, resolution_wh, padding, include_free_zone,
+        camera_view=camera_view)
     if labels is not None and len(labels) != len(canvas_points):
         raise ValueError("labels and points must have equal lengths")
     for index, point in enumerate(np.rint(canvas_points).astype(int)):
@@ -147,20 +177,23 @@ def draw_player_tracks_on_volleyball_court(
     player_points: Mapping[int, Point],
     trajectories: Optional[Mapping[int, Sequence[Point]]] = None,
     trajectory_length: int = 30,
-    resolution_wh: Resolution = (600, 900),
+    resolution_wh: Optional[Resolution] = None,
     padding: int = 40,
     include_free_zone: bool = True,
+    camera_view: CameraView = CameraView.ENDLINE,
 ) -> np.ndarray:
     """Render current tracker positions and optional recent trajectory tails."""
     court = draw_volleyball_court(
-        config, resolution_wh, padding, include_free_zone)
+        config, resolution_wh, padding, include_free_zone,
+        camera_view=camera_view)
     if trajectories:
         for track_id, path in trajectories.items():
             recent_path = np.asarray(list(path)[-trajectory_length:], dtype=np.float32)
             if len(recent_path) < 2:
                 continue
             pixels = np.rint(court_to_canvas(
-                config, recent_path, resolution_wh, padding, include_free_zone
+                config, recent_path, resolution_wh, padding, include_free_zone,
+                camera_view=camera_view,
             )).astype(np.int32)
             cv2.polylines(court, [pixels], False, (180, 180, 180), 2, cv2.LINE_AA)
 
@@ -174,4 +207,5 @@ def draw_player_tracks_on_volleyball_court(
         resolution_wh=resolution_wh,
         padding=padding,
         include_free_zone=include_free_zone,
+        camera_view=camera_view,
     )

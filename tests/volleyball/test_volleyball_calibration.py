@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 
 from sports.common.calibration import CourtCalibration
-from sports.configs.volleyball import VolleyballCourtConfiguration
+from sports.configs.volleyball import CameraView, VolleyballCourtConfiguration
 
 
 def _synthetic_landmarks():
@@ -127,7 +127,11 @@ def test_fixed_perturbations_report_error_and_reasonable_recovery() -> None:
 
 def test_calibration_v2_json_roundtrip(tmp_path) -> None:
     _config, landmarks, _matrix = _synthetic_landmarks()
-    calibration = CourtCalibration(landmarks=landmarks, source_video="match.mp4")
+    calibration = CourtCalibration(
+        landmarks=landmarks,
+        source_video="match.mp4",
+        camera_view=CameraView.SIDELINE,
+    )
     path = tmp_path / "calibration.json"
 
     calibration.save(path)
@@ -137,6 +141,8 @@ def test_calibration_v2_json_roundtrip(tmp_path) -> None:
     assert restored.to_dict()["version"] == 2
     assert "landmarks" in restored.to_dict()
     assert "fit" in restored.to_dict()
+    assert restored.camera_view is CameraView.SIDELINE
+    assert restored.to_dict()["camera_view"] == "sideline"
 
 
 def test_version_one_four_corner_file_migrates(tmp_path) -> None:
@@ -158,6 +164,7 @@ def test_version_one_four_corner_file_migrates(tmp_path) -> None:
     calibration = CourtCalibration.load(path)
 
     assert calibration.version == 2
+    assert calibration.camera_view is CameraView.ENDLINE
     assert set(calibration.landmarks) == {
         "far_left_corner", "far_right_corner", "near_right_corner",
         "near_left_corner",
@@ -167,4 +174,26 @@ def test_version_one_four_corner_file_migrates(tmp_path) -> None:
             calibration.image_points_array),
         calibration.court_points_array,
         atol=1e-4,
+    )
+
+
+def test_v2_without_camera_view_defaults_to_endline() -> None:
+    _config, landmarks, _matrix = _synthetic_landmarks()
+    data = CourtCalibration(landmarks=landmarks).to_dict()
+    data.pop("camera_view")
+
+    calibration = CourtCalibration.from_dict(data)
+
+    assert calibration.camera_view is CameraView.ENDLINE
+
+
+def test_camera_view_never_changes_metric_homography() -> None:
+    _config, landmarks, _matrix = _synthetic_landmarks()
+    point = np.asarray([(500.0, 400.0)], dtype=np.float32)
+    endline = CourtCalibration(landmarks=landmarks, camera_view=CameraView.ENDLINE)
+    sideline = CourtCalibration(landmarks=landmarks, camera_view=CameraView.SIDELINE)
+
+    np.testing.assert_array_equal(
+        endline.create_transformer().transform_points(point),
+        sideline.create_transformer().transform_points(point),
     )

@@ -6,7 +6,11 @@ from pathlib import Path
 from typing import Optional, Sequence
 
 from sports.common.calibration import CourtCalibration
-from sports.configs.volleyball import VolleyballCourtConfiguration
+from sports.configs.volleyball import (
+    CameraView,
+    VolleyballCourtConfiguration,
+    default_tactical_resolution,
+)
 
 try:
     from .calibration import (
@@ -61,6 +65,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument(
+        "--camera-view",
+        choices=tuple(view.value for view in CameraView),
+        help=("Camera position: endline or sideline. New calibrations default to "
+              "endline; saved calibrations retain their stored value."),
+    )
+    parser.add_argument(
         "--player-model", default="auto",
         help="auto, official yolo26n/s.pt, or a trusted local checkpoint path")
     parser.add_argument(
@@ -83,8 +93,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--start-time", type=float, default=0.0)
     parser.add_argument("--end-time", type=float)
     parser.add_argument("--max-frames", type=int)
-    parser.add_argument("--tactical-width", type=int, default=600)
-    parser.add_argument("--tactical-height", type=int, default=900)
+    parser.add_argument(
+        "--tactical-width", type=int,
+        help="Tactical canvas width (default: 450 endline, 900 sideline)")
+    parser.add_argument(
+        "--tactical-height", type=int,
+        help="Tactical canvas height (default: 900 endline, 450 sideline)")
     parser.add_argument("--tactical-padding", type=int, default=40)
     parser.add_argument("--trajectory-length", type=int, default=30)
     parser.add_argument("--show-calibration", action="store_true")
@@ -112,7 +126,8 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("Analysis margins cannot be negative.")
     if not 0.0 <= args.confidence <= 1.0:
         raise ValueError("--confidence must be between 0 and 1.")
-    if args.tactical_width <= 0 or args.tactical_height <= 0:
+    if ((args.tactical_width is not None and args.tactical_width <= 0)
+            or (args.tactical_height is not None and args.tactical_height <= 0)):
         raise ValueError("Tactical video dimensions must be positive.")
     if args.tactical_padding < 0:
         raise ValueError("--tactical-padding cannot be negative.")
@@ -122,6 +137,23 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--youtube-max-height must be positive.")
     if args.calibration_ransac_threshold <= 0:
         raise ValueError("--calibration-ransac-threshold must be positive.")
+
+
+def resolve_camera_view(
+    requested: Optional[str],
+    calibration: Optional[CourtCalibration] = None,
+) -> CameraView:
+    """Resolve the effective view, rejecting saved/CLI orientation conflicts."""
+    requested_view = CameraView(requested) if requested is not None else None
+    if calibration is None:
+        return requested_view or CameraView.ENDLINE
+    if requested_view is not None and requested_view is not calibration.camera_view:
+        raise ValueError(
+            "Calibration was created with camera_view="
+            f"{calibration.camera_view.value}, but CLI requested camera_view="
+            f"{requested_view.value}. Use the matching orientation or recalibrate."
+        )
+    return calibration.camera_view
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -178,14 +210,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             f"Could not load player model '{resolved_model.path}': {exc}")
     calibration_frame = read_video_frame(source_video, args.calibration_time)
     if args.calibration_file is not None and args.calibration_file.is_file():
-        calibration = CourtCalibration.load(args.calibration_file)
+        try:
+            calibration = CourtCalibration.load(args.calibration_file)
+            camera_view = resolve_camera_view(args.camera_view, calibration)
+        except ValueError as exc:
+            parser.error(str(exc))
         LOGGER.info("Loaded calibration from %s", args.calibration_file)
     else:
+        camera_view = resolve_camera_view(args.camera_view)
         calibration = collect_manual_calibration(
             calibration_frame,
             source_video,
             config,
             ransac_threshold_m=args.calibration_ransac_threshold,
+            camera_view=camera_view,
         )
         if args.calibration_file is not None:
             calibration.save(args.calibration_file)
@@ -197,16 +235,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.show_calibration:
         show_calibration_preview(calibration_frame, calibration, config)
 
+    default_width, default_height = default_tactical_resolution(camera_view)
     options = PipelineOptions(
         start_time=args.start_time,
         end_time=args.end_time,
         max_frames=args.max_frames,
-        tactical_resolution=(args.tactical_width, args.tactical_height),
+        tactical_resolution=(
+            args.tactical_width or default_width,
+            args.tactical_height or default_height,
+        ),
         tactical_padding=args.tactical_padding,
         trajectory_length=args.trajectory_length,
         show_detections=args.show_detections,
         show_track_ids=args.show_track_ids,
         preview_tactical_view=args.show_tactical_view,
+        camera_view=camera_view,
     )
     frame_count = run_pipeline(
         source_video=source_video,

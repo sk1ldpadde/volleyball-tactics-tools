@@ -9,7 +9,7 @@ import cv2
 import numpy as np
 
 from sports.common.view import ViewTransformer
-from sports.configs.volleyball import VolleyballCourtConfiguration
+from sports.configs.volleyball import CameraView, VolleyballCourtConfiguration
 
 
 LEGACY_POINT_NAMES = ("far_left", "far_right", "near_right", "near_left")
@@ -76,6 +76,7 @@ class CourtCalibration:
     source_video: str
     court_width_m: float
     court_length_m: float
+    camera_view: CameraView
     ransac_threshold_m: float
     version: int
     fit: CalibrationFit
@@ -89,6 +90,7 @@ class CourtCalibration:
         source_video: str = "",
         court_width_m: float = 9.0,
         court_length_m: float = 18.0,
+        camera_view: Union[CameraView, str] = CameraView.ENDLINE,
         ransac_threshold_m: float = DEFAULT_RANSAC_THRESHOLD_M,
         version: int = 2,
     ) -> None:
@@ -103,6 +105,12 @@ class CourtCalibration:
             raise ValueError("Calibration court dimensions must be positive.")
         if ransac_threshold_m <= 0:
             raise ValueError("RANSAC threshold must be positive.")
+        try:
+            normalized_camera_view = CameraView(camera_view)
+        except ValueError as exc:
+            raise ValueError(
+                f"Unsupported camera view: {camera_view!r}. Expected endline or sideline."
+            ) from exc
 
         normalized = self._normalize_landmarks(raw_points)
         if len(normalized) < 4:
@@ -138,6 +146,7 @@ class CourtCalibration:
         object.__setattr__(self, "source_video", source_video)
         object.__setattr__(self, "court_width_m", float(court_width_m))
         object.__setattr__(self, "court_length_m", float(court_length_m))
+        object.__setattr__(self, "camera_view", normalized_camera_view)
         object.__setattr__(self, "ransac_threshold_m", float(ransac_threshold_m))
         object.__setattr__(self, "version", 2)
         object.__setattr__(self, "fit", fit)
@@ -240,6 +249,7 @@ class CourtCalibration:
             "coordinate_system": "meters",
             "court_width_m": self.court_width_m,
             "court_length_m": self.court_length_m,
+            "camera_view": self.camera_view.value,
             "ransac_threshold_m": self.ransac_threshold_m,
             "landmarks": {
                 name: [float(value) for value in point]
@@ -271,6 +281,7 @@ class CourtCalibration:
             source_video=str(data.get("source_video", "")),
             court_width_m=float(data.get("court_width_m", 9.0)),
             court_length_m=float(data.get("court_length_m", 18.0)),
+            camera_view=str(data.get("camera_view", CameraView.ENDLINE.value)),
             ransac_threshold_m=float(
                 data.get("ransac_threshold_m", DEFAULT_RANSAC_THRESHOLD_M)),
             version=version,

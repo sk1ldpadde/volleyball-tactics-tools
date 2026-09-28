@@ -56,6 +56,10 @@ dimensions live in `sports.configs.volleyball`, while rendering lives in
 interface so a differently licensed local detector can replace Ultralytics without
 changing geometry, tracking export, or rendering.
 
+`CameraView.ENDLINE` and `CameraView.SIDELINE` affect only calibration guidance and
+the tactical canvas. The homography always produces the same canonical 9 m × 18 m
+coordinates, so CSV coordinates remain comparable across camera positions.
+
 `examples.volleyball.source` is a narrow input adapter. It resolves a local path or
 downloads one YouTube video, then hands the same ordinary local `Path` to calibration
 and the existing processing pipeline. No YouTube-specific behavior exists downstream.
@@ -165,6 +169,30 @@ walks through the ten canonical landmarks in court order, shows the landmark nam
 metric coordinate, semantic description and a highlighted reference diagram. Never
 guess an off-screen point: press **S** to skip it.
 
+Select the camera position explicitly when creating a calibration:
+
+```text
+--camera-view endline   camera primarily behind a baseline (portrait reference)
+--camera-view sideline  camera primarily beside a long sideline (landscape reference)
+```
+
+The backward-compatible default for a new calibration is `endline`. In endline view,
+the reference shows the far baseline at the top and camera/near baseline at the bottom.
+In sideline view it is rotated clockwise, with the camera side at the bottom. Landmark
+names and metric coordinates do not rotate: `far_left_corner` is always `(0, 0)`, the
+net is always `y=9`, and `near_right_corner` is always `(9, 18)`.
+
+For a camera beside the long sideline, use:
+
+```bash
+python examples/volleyball/main.py \
+  --source-video match.mp4 \
+  --output-dir output-sideline \
+  --camera-view sideline \
+  --player-model auto \
+  --max-frames 500
+```
+
 Controls:
 
 - click — assign the current landmark;
@@ -193,6 +221,7 @@ Create calibration and process a short development sample:
 python examples/volleyball/main.py \
   --source-video match.mp4 \
   --output-dir output \
+  --camera-view endline \
   --calibration manual \
   --calibration-file output/calibration.json \
   --player-model auto \
@@ -204,8 +233,9 @@ python examples/volleyball/main.py \
 
 On later runs, the existing file passed to `--calibration-file` is loaded without a
 clicking step. Both legacy v1 four-corner files and v2 arbitrary-landmark files are
-accepted; loaded v1 correspondences are migrated internally and outputs are saved as
-v2. To process a time slice:
+accepted; files without `camera_view` default to `endline`, and outputs are saved as
+v2. A supplied `--camera-view` must match the saved value or the command stops with a
+clear error. To process a time slice:
 
 ```bash
 python examples/volleyball/main.py \
@@ -247,6 +277,10 @@ Every output directory contains:
 - `combined.mp4` — synchronized annotated and tactical frames side by side.
 
 All generated videos use source FPS and frame order. Audio is not copied in this MVP.
+The default tactical canvas is 450 × 900 for endline view and 900 × 450 for sideline
+view. `--tactical-width` and `--tactical-height` still override these values. The
+combined output scales and letterboxes the tactical panel without changing its aspect
+ratio or allowing a landscape sideline panel to dominate the source frame.
 
 ## Coordinates and filtering
 
