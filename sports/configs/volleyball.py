@@ -42,25 +42,45 @@ class VolleyballCourtConfiguration:
         )
 
     @property
-    def keypoints(self) -> Dict[str, Point]:
+    def landmarks(self) -> Dict[str, Point]:
+        """Canonical named court landmarks used by calibration.
+
+        The insertion order is the order presented by the manual calibration UI.
+        Compatibility aliases for the original MVP names are intentionally omitted
+        here so a calibration cannot accidentally contain the same point twice.
+        """
         far_attack_y, near_attack_y = self.attack_line_ys
         return {
             "far_left_corner": (0.0, 0.0),
             "far_right_corner": (self.width, 0.0),
-            "left_far_attack_line": (0.0, far_attack_y),
-            "right_far_attack_line": (self.width, far_attack_y),
-            "left_net": (0.0, self.center_line_y),
-            "right_net": (self.width, self.center_line_y),
-            "left_near_attack_line": (0.0, near_attack_y),
-            "right_near_attack_line": (self.width, near_attack_y),
+            "far_attack_left": (0.0, far_attack_y),
+            "far_attack_right": (self.width, far_attack_y),
+            "net_left": (0.0, self.center_line_y),
+            "net_right": (self.width, self.center_line_y),
+            "near_attack_left": (0.0, near_attack_y),
+            "near_attack_right": (self.width, near_attack_y),
             "near_left_corner": (0.0, self.length),
             "near_right_corner": (self.width, self.length),
         }
 
     @property
+    def keypoints(self) -> Dict[str, Point]:
+        """Landmarks plus aliases retained for the original MVP API."""
+        points = dict(self.landmarks)
+        points.update({
+            "left_far_attack_line": points["far_attack_left"],
+            "right_far_attack_line": points["far_attack_right"],
+            "left_net": points["net_left"],
+            "right_net": points["net_right"],
+            "left_near_attack_line": points["near_attack_left"],
+            "right_near_attack_line": points["near_attack_right"],
+        })
+        return points
+
+    @property
     def corner_points(self) -> List[Point]:
         """Corners ordered far-left, far-right, near-right, near-left."""
-        points = self.keypoints
+        points = self.landmarks
         return [
             points["far_left_corner"],
             points["far_right_corner"],

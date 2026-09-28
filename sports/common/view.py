@@ -1,4 +1,4 @@
-from typing import Tuple
+from typing import Optional, Tuple
 import cv2
 import numpy as np
 import numpy.typing as npt
@@ -22,7 +22,10 @@ class ViewTransformer:
     def __init__(
             self,
             source: npt.NDArray[np.float32],
-            target: npt.NDArray[np.float32]
+            target: npt.NDArray[np.float32],
+            method: int = 0,
+            ransac_reproj_threshold: float = 3.0,
+            minimum_inliers: int = 4,
     ) -> None:
         """
         Initialize the ViewTransformer with source and target points.
@@ -44,11 +47,47 @@ class ViewTransformer:
         if not np.isfinite(source).all() or not np.isfinite(target).all():
             raise ValueError("Source and target points must be finite.")
 
-        source = source.astype(np.float32)
-        target = target.astype(np.float32)
-        self.m, _ = cv2.findHomography(source, target)
+        source = source.astype(np.float64)
+        target = target.astype(np.float64)
+        if np.unique(source, axis=0).shape[0] != source.shape[0]:
+            raise ValueError("Source points must be unique.")
+        if np.unique(target, axis=0).shape[0] != target.shape[0]:
+            raise ValueError("Target points must be unique.")
+        if np.linalg.matrix_rank(
+                np.column_stack((source, np.ones(source.shape[0])))) < 3:
+            raise ValueError("Source points are degenerate (collinear).")
+        if np.linalg.matrix_rank(
+                np.column_stack((target, np.ones(target.shape[0])))) < 3:
+            raise ValueError("Target points are degenerate (collinear).")
+        if ransac_reproj_threshold <= 0:
+            raise ValueError("RANSAC reprojection threshold must be positive.")
+
+        self.m, mask = cv2.findHomography(
+            source,
+            target,
+            method=method,
+            ransacReprojThreshold=ransac_reproj_threshold,
+        )
         if self.m is None:
             raise ValueError("Homography matrix could not be calculated.")
+        if not np.isfinite(self.m).all():
+            raise ValueError("Homography matrix contains non-finite values.")
+        scale = self.m[2, 2]
+        if abs(scale) > np.finfo(float).eps:
+            self.m = self.m / scale
+        determinant = float(np.linalg.det(self.m))
+        condition = float(np.linalg.cond(self.m))
+        if abs(determinant) < 1e-12 or not np.isfinite(condition) or condition > 1e12:
+            raise ValueError("Homography matrix is numerically unstable.")
+
+        self.inlier_mask: Optional[npt.NDArray[np.bool_]] = (
+            None if mask is None else mask.reshape(-1).astype(bool)
+        )
+        if self.inlier_mask is not None and int(self.inlier_mask.sum()) < minimum_inliers:
+            raise ValueError(
+                f"Homography retained only {int(self.inlier_mask.sum())} inliers; "
+                f"at least {minimum_inliers} are required."
+            )
 
         try:
             self.inverse_m = np.linalg.inv(self.m)

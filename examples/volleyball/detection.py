@@ -1,7 +1,7 @@
 """Replaceable local player-detection adapters."""
 
 from pathlib import Path
-from typing import Protocol, Union
+from typing import Dict, Protocol, Union
 
 import numpy as np
 import supervision as sv
@@ -15,7 +15,7 @@ class PlayerDetector(Protocol):
 
 
 class UltralyticsPlayerDetector:
-    """Person-only Ultralytics YOLO adapter using user-supplied local weights."""
+    """Person-only adapter for already-resolved local Ultralytics weights."""
 
     def __init__(
         self,
@@ -47,6 +47,17 @@ class UltralyticsPlayerDetector:
         self._device = device
         self._person_class_id = person_class_id
         self._image_size = image_size
+
+    @property
+    def task(self) -> str:
+        return str(getattr(self._model, "task", ""))
+
+    @property
+    def class_names(self) -> Dict[int, str]:
+        names = getattr(self._model, "names", {})
+        if isinstance(names, list):
+            return dict(enumerate(str(name) for name in names))
+        return {int(key): str(value) for key, value in names.items()}
 
     def detect(self, frame: np.ndarray) -> sv.Detections:
         result = self._model.predict(

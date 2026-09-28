@@ -37,7 +37,8 @@ setuptools.setup(
         ],
         'volleyball': [
             'supervision<0.30',
-            'ultralytics',
+            'ultralytics>=8.4.0',
+            'yt-dlp',
         ],
     },
     classifiers=[

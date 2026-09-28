@@ -3,15 +3,17 @@
 This local CLI turns a fixed-camera volleyball recording into tracked player boxes,
 metric court positions, a synchronized top-down view, and structured CSV data. Manual
 calibration is deliberately the reliable default; no cloud API, web server, ball model,
-or automatic court model is involved.
+or automatic court model is involved. The input may be an existing local file or one
+public YouTube video downloaded to a persistent local cache before analysis starts.
 
 ## Current scope
 
 The MVP:
 
-- collects or reloads four ordered outer-court corners;
+- collects or reloads any four or more visible named court landmarks (6+ recommended);
 - maps player bounding-box bottom centers into a 9 m × 18 m court;
-- detects only a configurable person class from local Ultralytics-compatible weights;
+- detects only the COCO person class using an official auto-resolved Ultralytics model
+  or a trusted local compatible checkpoint;
 - assigns temporary ByteTrack IDs;
 - retains positions inside configurable side/baseline analysis margins;
 - writes annotated, tactical, and side-by-side MP4 files plus `player_tracks.csv`.
@@ -54,6 +56,10 @@ dimensions live in `sports.configs.volleyball`, while rendering lives in
 interface so a differently licensed local detector can replace Ultralytics without
 changing geometry, tracking export, or rendering.
 
+`examples.volleyball.source` is a narrow input adapter. It resolves a local path or
+downloads one YouTube video, then hands the same ordinary local `Path` to calibration
+and the existing processing pipeline. No YouTube-specific behavior exists downstream.
+
 The volleyball extra currently constrains Supervision below 0.30 because its bundled
 ByteTrack API is deprecated for removal in 0.30. Replacing that adapter with the new
 standalone tracker package is a future compatibility task; court geometry and rendering
@@ -69,30 +75,117 @@ source .venv/bin/activate
 python -m pip install -e '.[volleyball,tests]'
 ```
 
-The command requires a local Ultralytics-compatible detection checkpoint. It will not
-accept a bare model name such as `yolo11n.pt`, because Ultralytics can download missing
-named weights automatically. Obtain weights under terms appropriate for your use,
-store them locally, and pass their exact path. Only load model files from a trusted
-source: PyTorch-compatible checkpoints can be unsafe when untrusted.
+Use Python 3.10 or newer for YouTube input so pip can install a current yt-dlp
+release. Local-file processing retains the repository's Python 3.8 minimum; on older
+Python versions pip may select an older yt-dlp release that no longer tracks YouTube
+changes reliably.
+
+The default `--player-model auto` uses the installed Ultralytics version and hardware.
+Ultralytics 8.4.0 or newer selects YOLO26: `yolo26s.pt` on CUDA and `yolo26n.pt` on
+CPU or MPS. Older compatible installations fall back to the corresponding mature
+YOLO11 model. Only official nano/small detection names are eligible for automatic
+download, and weights are stored under `models/ultralytics/` (ignored by Git).
+
+Prepare and perform an actual inference smoke test before processing video:
+
+```bash
+python examples/volleyball/setup_models.py
+```
+
+This reports Torch/Ultralytics versions, available CUDA/MPS hardware, the selected
+device and exact model path, then runs inference on a synthetic image and verifies
+that the model is a detection model with COCO class 0 named `person`. Use
+`--player-model yolo26n.pt` or `yolo26s.pt` for an explicit official choice. A custom
+checkpoint must be an existing local path. Only load custom PyTorch-compatible model
+files from a trusted source.
 
 Ultralytics software and its default trained weights are currently offered under
 AGPL-3.0 or a separate Enterprise license. That is distinct from this repository's MIT
 code license. Review [the license notes](../../docs/volleyball-third-party.md) before
 distribution or commercial use.
 
+## Input sources
+
+Exactly one of `--source-video` and `--youtube-url` is required.
+
+### Local file
+
+Local paths are expanded (including `~`), resolved, validated, and used in place; they
+are not copied into the download cache.
+
+```bash
+python examples/volleyball/main.py \
+  --source-video match.mp4 \
+  --output-dir output \
+  --player-model auto \
+  --max-frames 500
+```
+
+### YouTube
+
+YouTube input uses the `yt-dlp` Python API, disables playlists, and defaults to the best
+video up to 1080p plus audio. The maximum can be changed with
+`--youtube-max-height`. The downloaded media is resolved before calibration begins.
+
+```bash
+python examples/volleyball/main.py \
+  --youtube-url "https://www.youtube.com/watch?v=VIDEO_ID" \
+  --download-dir data/youtube \
+  --output-dir output \
+  --player-model auto \
+  --max-frames 500
+```
+
+Files remain visible and reusable after processing:
+
+```text
+data/youtube/VIDEO_ID/
+├── video.mp4
+└── metadata.json
+```
+
+The actual media extension may differ when MP4 is unavailable. A valid cached
+`video.*` is reused automatically; pass `--redownload` to replace only that video's
+download files. Titles are stored only in the sanitized metadata and are never used as
+paths.
+
+FFmpeg is strongly recommended and must be available as the `ffmpeg` executable on
+`PATH` to merge separate high-quality video and audio streams. Without it, the adapter
+tries a compatible single-file stream and reports an actionable error if none can be
+used. It never installs system packages or loads browser cookies.
+
+Only download and process media when you have permission to do so and when doing so
+complies with the source platform's terms and applicable law. Automated tests mock
+yt-dlp and never access YouTube.
+
 ## Manual calibration
 
-Choose a frame where all four outer corners are visible. Click exactly:
+Choose a frame with as many visible line/sideline intersections as practical. The UI
+walks through the ten canonical landmarks in court order, shows the landmark name,
+metric coordinate, semantic description and a highlighted reference diagram. Never
+guess an off-screen point: press **S** to skip it.
 
-1. far-left baseline corner;
-2. far-right baseline corner;
-3. near-right baseline corner;
-4. near-left baseline corner.
+Controls:
 
-Each click is labelled immediately. Once four points exist, the boundary, attack
-lines, and net/center line are projected back into the image. Press **Enter** to
-confirm, **R** to restart, or **Escape** to cancel. Calibration assumes the camera is
-fixed for the whole processed segment.
+- click — assign the current landmark;
+- **S** — skip an invisible landmark;
+- **U** — undo the previous click or skip;
+- **R** — restart;
+- **Enter** — fit once at least four non-degenerate points are present;
+- **Escape** — cancel.
+
+Six or more well-distributed landmarks are strongly recommended. The solver uses
+RANSAC with a default `0.15 m` court-space threshold (configurable with
+`--calibration-ransac-threshold`). After fitting, it projects both baselines, both
+sidelines, both attack lines, the net line and every landmark back into the camera
+frame—even where the inferred court lies off screen. Review the inlier count, rejected
+points, court-space and image-space residuals, then press **Enter** to accept or **R**
+to recalibrate.
+
+The displayed good/warning/poor bands use median inlier court error below 0.10 m,
+0.10–0.25 m, and above 0.25 m. These are diagnostics, not accuracy guarantees.
+Concentrated landmarks also trigger an extrapolation warning. Calibration assumes the
+camera remains fixed for the whole processed segment.
 
 Create calibration and process a short development sample:
 
@@ -102,22 +195,24 @@ python examples/volleyball/main.py \
   --output-dir output \
   --calibration manual \
   --calibration-file output/calibration.json \
-  --player-model /absolute/path/to/trusted-person-model.pt \
-  --device cpu \
+  --player-model auto \
+  --device auto \
   --max-frames 500 \
   --show-calibration \
   --show-tactical-view
 ```
 
 On later runs, the existing file passed to `--calibration-file` is loaded without a
-clicking step. To process a time slice:
+clicking step. Both legacy v1 four-corner files and v2 arbitrary-landmark files are
+accepted; loaded v1 correspondences are migrated internally and outputs are saved as
+v2. To process a time slice:
 
 ```bash
 python examples/volleyball/main.py \
   --source-video match.mp4 \
   --output-dir output-slice \
   --calibration-file output/calibration.json \
-  --player-model /absolute/path/to/trusted-person-model.pt \
+  --player-model auto \
   --device mps \
   --start-time 60 \
   --end-time 90 \
@@ -131,7 +226,7 @@ python examples/volleyball/main.py \
   --source-video match.mp4 \
   --output-dir output-full \
   --calibration-file output/calibration.json \
-  --player-model /absolute/path/to/trusted-person-model.pt \
+  --player-model auto \
   --device cuda:0
 ```
 
@@ -144,7 +239,7 @@ otherwise require a display when a calibration file already exists.
 
 Every output directory contains:
 
-- `calibration.json` — self-contained image-to-court calibration;
+- `calibration.json` — v2 named correspondences and recomputed fit diagnostics;
 - `player_tracks.csv` — frame, timestamp, temporary ID, confidence, box, pixel foot
   point, metric court point, and court/analysis-area membership;
 - `annotated.mp4` — camera view with calibrated lines, boxes, foot points, and IDs;
@@ -179,6 +274,9 @@ so `x` may be `-3..12` and `y` may be `-5..23`. Adjust with `--side-margin` and
 - A single planar homography is valid for floor contact points, not airborne bodies or
   balls. The bottom-center box anchor is only an approximation of foot contact.
 - Calibration becomes invalid after camera pan, zoom, stabilization crop, or relocation.
+- Four-point fits have no redundancy for outlier rejection; use 6+ distributed points
+  whenever possible. Projection into an unseen end remains an extrapolation and should
+  be checked carefully in the full-court preview.
 - MP4 encoding depends on the local OpenCV `mp4v` codec build. Outputs are video-only.
 
 ## Roadmap

@@ -16,6 +16,8 @@ try:
     )
     from .detection import UltralyticsPlayerDetector
     from .pipeline import PipelineOptions, run_pipeline
+    from .models import ModelSetupError, resolve_player_model
+    from .source import VideoSourceError, resolve_video_source
 except ImportError:  # Support ``python examples/volleyball/main.py``.
     from calibration import (
         collect_manual_calibration,
@@ -24,6 +26,8 @@ except ImportError:  # Support ``python examples/volleyball/main.py``.
     )
     from detection import UltralyticsPlayerDetector
     from pipeline import PipelineOptions, run_pipeline
+    from models import ModelSetupError, resolve_player_model
+    from source import VideoSourceError, resolve_video_source
 
 
 LOGGER = logging.getLogger("volleyball")
@@ -35,9 +39,33 @@ def build_parser() -> argparse.ArgumentParser:
             "Detect and track volleyball players, project their foot points into "
             "metric court coordinates, and render synchronized tactical video."
         ))
-    parser.add_argument("--source-video", type=Path, required=True)
+    input_group = parser.add_mutually_exclusive_group(required=True)
+    input_group.add_argument("--source-video", type=Path, help="Existing local video")
+    input_group.add_argument("--youtube-url", help="One public YouTube video URL")
+    parser.add_argument(
+        "--download-dir",
+        type=Path,
+        default=Path("data/youtube"),
+        help="Persistent YouTube cache (default: data/youtube)",
+    )
+    parser.add_argument(
+        "--youtube-max-height",
+        type=int,
+        default=1080,
+        help="Maximum downloaded video height (default: 1080)",
+    )
+    parser.add_argument(
+        "--redownload",
+        action="store_true",
+        help="Replace the selected YouTube video's cached media",
+    )
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--player-model", type=Path, required=True)
+    parser.add_argument(
+        "--player-model", default="auto",
+        help="auto, official yolo26n/s.pt, or a trusted local checkpoint path")
+    parser.add_argument(
+        "--models-dir", type=Path, default=Path("models/ultralytics"),
+        help="Project-local official model cache (default: models/ultralytics)")
     parser.add_argument("--calibration", choices=("manual",), default="manual")
     parser.add_argument(
         "--calibration-file", type=Path,
@@ -45,7 +73,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--calibration-time", type=float, default=0.0)
     parser.add_argument("--confidence", type=float, default=0.25)
     parser.add_argument("--person-class-id", type=int, default=0)
-    parser.add_argument("--device", default="cpu", help="cpu, cuda, cuda:0, or mps")
+    parser.add_argument("--device", default="auto", help="auto, cpu, cuda, cuda:0, or mps")
+    parser.add_argument(
+        "--calibration-ransac-threshold", type=float, default=0.15,
+        help="Court-space RANSAC threshold in metres (default: 0.15)")
     parser.add_argument("--image-size", type=int, default=1280)
     parser.add_argument("--side-margin", type=float, default=3.0)
     parser.add_argument("--baseline-margin", type=float, default=5.0)
@@ -58,6 +89,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--trajectory-length", type=int, default=30)
     parser.add_argument("--show-calibration", action="store_true")
     parser.add_argument(
+        "--debug", action="store_true", help="Show tracebacks for source errors")
+    parser.add_argument(
         "--show-tactical-view", action="store_true",
         help="Open a live preview; press q to stop processing.")
     parser.add_argument("--show-detections", dest="show_detections", action="store_true")
@@ -69,8 +102,6 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _validate_args(args: argparse.Namespace) -> None:
-    if not args.source_video.is_file():
-        raise FileNotFoundError(f"Source video does not exist: {args.source_video}")
     if args.start_time < 0 or args.calibration_time < 0:
         raise ValueError("Time values cannot be negative.")
     if args.end_time is not None and args.end_time <= args.start_time:
@@ -79,12 +110,6 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--max-frames must be positive.")
     if args.side_margin < 0 or args.baseline_margin < 0:
         raise ValueError("Analysis margins cannot be negative.")
-    if not args.player_model.expanduser().is_file():
-        raise FileNotFoundError(
-            f"Player model weights were not found at '{args.player_model}'. "
-            "Provide a trusted local checkpoint with --player-model; bare model "
-            "names are not downloaded automatically."
-        )
     if not 0.0 <= args.confidence <= 1.0:
         raise ValueError("--confidence must be between 0 and 1.")
     if args.tactical_width <= 0 or args.tactical_height <= 0:
@@ -93,32 +118,75 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--tactical-padding cannot be negative.")
     if args.trajectory_length <= 0:
         raise ValueError("--trajectory-length must be positive.")
+    if args.youtube_max_height <= 0:
+        raise ValueError("--youtube-max-height must be positive.")
+    if args.calibration_ransac_threshold <= 0:
+        raise ValueError("--calibration-ransac-threshold must be positive.")
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    args = build_parser().parse_args(argv)
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    logging.basicConfig(
+        level=logging.DEBUG if args.debug else logging.INFO,
+        format="%(levelname)s %(message)s",
+    )
     _validate_args(args)
+    try:
+        resolved_source = resolve_video_source(
+            source_video=args.source_video,
+            youtube_url=args.youtube_url,
+            download_dir=args.download_dir,
+            youtube_max_height=args.youtube_max_height,
+            redownload=args.redownload,
+        )
+    except VideoSourceError as exc:
+        if args.debug:
+            raise
+        parser.error(str(exc))
+    source_video = resolved_source.video_path
+    LOGGER.info("Starting volleyball analysis from %s", source_video)
     args.output_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        resolved_model = resolve_player_model(
+            args.player_model,
+            models_dir=args.models_dir,
+            requested_device=args.device,
+        )
+    except ModelSetupError as exc:
+        if args.debug:
+            raise
+        parser.error(str(exc))
 
     config = VolleyballCourtConfiguration(
         side_margin=args.side_margin,
         baseline_margin=args.baseline_margin,
     )
-    detector = UltralyticsPlayerDetector(
-        model_path=args.player_model,
-        confidence=args.confidence,
-        device=args.device,
-        person_class_id=args.person_class_id,
-        image_size=args.image_size,
-    )
-    calibration_frame = read_video_frame(args.source_video, args.calibration_time)
+    try:
+        detector = UltralyticsPlayerDetector(
+            model_path=resolved_model.path,
+            confidence=args.confidence,
+            device=resolved_model.device,
+            person_class_id=args.person_class_id,
+            image_size=args.image_size,
+        )
+    except Exception as exc:
+        if args.debug:
+            raise
+        parser.error(
+            f"Could not load player model '{resolved_model.path}': {exc}")
+    calibration_frame = read_video_frame(source_video, args.calibration_time)
     if args.calibration_file is not None and args.calibration_file.is_file():
         calibration = CourtCalibration.load(args.calibration_file)
         LOGGER.info("Loaded calibration from %s", args.calibration_file)
     else:
         calibration = collect_manual_calibration(
-            calibration_frame, args.source_video, config)
+            calibration_frame,
+            source_video,
+            config,
+            ransac_threshold_m=args.calibration_ransac_threshold,
+        )
         if args.calibration_file is not None:
             calibration.save(args.calibration_file)
             LOGGER.info("Saved reusable calibration to %s", args.calibration_file)
@@ -141,7 +209,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         preview_tactical_view=args.show_tactical_view,
     )
     frame_count = run_pipeline(
-        source_video=args.source_video,
+        source_video=source_video,
         output_dir=args.output_dir,
         detector=detector,
         calibration=calibration,
