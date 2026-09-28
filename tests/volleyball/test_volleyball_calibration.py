@@ -4,7 +4,7 @@ import cv2
 import numpy as np
 import pytest
 
-from sports.common.calibration import CourtCalibration
+from sports.common.calibration import CourtCalibration, ImageOcclusionZone
 from sports.configs.volleyball import CameraView, VolleyballCourtConfiguration
 
 
@@ -131,6 +131,10 @@ def test_calibration_v2_json_roundtrip(tmp_path) -> None:
         landmarks=landmarks,
         source_video="match.mp4",
         camera_view=CameraView.SIDELINE,
+        image_occlusion_zones=(ImageOcclusionZone(
+            name="referee_stand",
+            points=((700.0, 200.0), (820.0, 200.0), (820.0, 620.0), (700.0, 620.0)),
+        ),),
     )
     path = tmp_path / "calibration.json"
 
@@ -143,6 +147,8 @@ def test_calibration_v2_json_roundtrip(tmp_path) -> None:
     assert "fit" in restored.to_dict()
     assert restored.camera_view is CameraView.SIDELINE
     assert restored.to_dict()["camera_view"] == "sideline"
+    assert restored.image_occlusion_zones == calibration.image_occlusion_zones
+    assert restored.to_dict()["image_occlusion_zones"][0]["name"] == "referee_stand"
 
 
 def test_version_one_four_corner_file_migrates(tmp_path) -> None:
@@ -165,6 +171,7 @@ def test_version_one_four_corner_file_migrates(tmp_path) -> None:
 
     assert calibration.version == 2
     assert calibration.camera_view is CameraView.ENDLINE
+    assert calibration.image_occlusion_zones == ()
     assert set(calibration.landmarks) == {
         "far_left_corner", "far_right_corner", "near_right_corner",
         "near_left_corner",

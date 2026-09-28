@@ -3,16 +3,21 @@ from examples.volleyball.selection import (
     ActivePlayerSelectorConfig,
     TrackCandidate,
     TrackSide,
+    VisibilityState,
 )
 from sports.configs.volleyball import CameraView, VolleyballCourtConfiguration
 
 
-def _candidate(track_id, y, confidence=0.8, x=4.5):
+def _candidate(
+    track_id, y, confidence=0.8, x=4.5, bbox=None, in_occlusion_zone=False,
+):
     return TrackCandidate(
         track_id=track_id,
         court_point=(x, y),
         confidence=confidence,
         inside_court=0 <= x <= 9 and 0 <= y <= 18,
+        bbox=bbox,
+        in_occlusion_zone=in_occlusion_zone,
     )
 
 
@@ -51,19 +56,146 @@ def test_stable_active_tracks_beat_new_high_confidence_candidate() -> None:
     assert not decisions[99].active
 
 
-def test_recent_established_track_reclaims_slot_after_short_occlusion() -> None:
+def test_recent_established_track_reserves_slot_during_short_dropout() -> None:
     selector = ActivePlayerSelector(VolleyballCourtConfiguration())
     established = [_candidate(index, 5.0, confidence=0.75) for index in range(6)]
     for frame_index in range(12):
         selector.select(established, frame_index)
 
     replacement_frame = established[1:] + [_candidate(99, 5.0, confidence=0.99)]
-    assert 99 in _active(selector.select(replacement_frame, 12), TrackSide.FAR)
+    missing = selector.select(replacement_frame, 12)
+    assert set(_active(missing, TrackSide.FAR)) == set(range(6))
+    assert not missing[0].position_observed
+    assert missing[0].visibility is VisibilityState.LOST
+    assert not missing[99].active
 
     returned = selector.select(
         established + [_candidate(99, 5.0, confidence=0.99)], frame_index=13)
     assert set(_active(returned, TrackSide.FAR)) == set(range(6))
     assert not returned[99].active
+
+
+def test_referee_overlap_preserves_sixth_player_as_occluded() -> None:
+    selector = ActivePlayerSelector(
+        VolleyballCourtConfiguration(),
+        ActivePlayerSelectorConfig(active_occlusion_grace_frames=20),
+    )
+    player_box = (100.0, 100.0, 160.0, 220.0)
+    established = [
+        _candidate(index, 5.0, bbox=player_box if index == 2 else None)
+        for index in range(6)
+    ]
+    for frame_index in range(12):
+        selector.select(established, frame_index)
+
+    visible = [candidate for candidate in established if candidate.track_id != 2]
+    visible.append(_candidate(90, 8.9, confidence=0.99, bbox=(120, 80, 180, 240)))
+    for offset in range(15):
+        decisions = selector.select(
+            visible,
+            12 + offset,
+            occluder_bboxes=(
+                ((120.0, 80.0, 180.0, 240.0),) if offset == 0 else ()),
+        )
+        assert len(_active(decisions, TrackSide.FAR)) == 6
+        assert sum(
+            decision.active and decision.visible for decision in decisions.values()
+        ) == 5
+        assert decisions[2].active and decisions[2].occluded
+        assert decisions[2].occlusion_evidence == "dynamic_person_overlap"
+        assert not decisions[90].active
+
+
+def test_occluded_player_reappears_without_seventh_member() -> None:
+    selector = ActivePlayerSelector(
+        VolleyballCourtConfiguration(),
+        ActivePlayerSelectorConfig(
+            active_occlusion_grace_frames=20, active_confirmation_frames=3),
+    )
+    established = [
+        _candidate(index, 5.0, bbox=(100, 100, 160, 220) if index == 2 else None)
+        for index in range(6)
+    ]
+    for frame_index in range(4):
+        selector.select(established, frame_index)
+    missing = established[:2] + established[3:] + [_candidate(90, 5.0, 0.99)]
+    selector.select(missing, 4, occluder_bboxes=((110, 90, 170, 230),))
+
+    returned = selector.select(established + [_candidate(90, 5.0, 0.99)], 5)
+    assert set(_active(returned, TrackSide.FAR)) == set(range(6))
+    assert returned[2].visible
+    assert not returned[90].active
+
+
+def test_occlusion_grace_expiry_releases_slot() -> None:
+    selector = ActivePlayerSelector(
+        VolleyballCourtConfiguration(),
+        ActivePlayerSelectorConfig(
+            active_occlusion_grace_frames=3, active_confirmation_frames=2),
+    )
+    established = [_candidate(index, 5.0) for index in range(6)]
+    for frame_index in range(3):
+        selector.select(established, frame_index)
+    replacement = established[1:] + [_candidate(99, 5.0, 0.99)]
+    for frame_index in range(3, 7):
+        decisions = selector.select(replacement, frame_index)
+    assert 0 not in decisions
+    assert decisions[99].active
+
+
+def test_static_zone_is_occlusion_evidence() -> None:
+    selector = ActivePlayerSelector(
+        VolleyballCourtConfiguration(),
+        ActivePlayerSelectorConfig(active_confirmation_frames=2),
+    )
+    established = [
+        _candidate(index, 5.0, in_occlusion_zone=index == 4)
+        for index in range(6)
+    ]
+    selector.select(established, 0)
+    selector.select(established, 1)
+    decisions = selector.select(established[:4] + established[5:], 2)
+    assert decisions[4].active and decisions[4].occluded
+    assert decisions[4].occlusion_evidence == "static_zone"
+
+
+def test_long_lived_stationary_net_track_does_not_win_on_age_alone() -> None:
+    selector = ActivePlayerSelector(
+        VolleyballCourtConfiguration(),
+        ActivePlayerSelectorConfig(
+            movement_window_frames=12,
+            stationary_footprint_m=0.2,
+            stationary_referee_penalty=2.0,
+        ),
+    )
+    for frame_index in range(20):
+        players = [
+            _candidate(index, 5.0 + 0.2 * ((frame_index + index) % 3), 0.75,
+                       x=1.0 + index)
+            for index in range(6)
+        ]
+        referee = _candidate(
+            99, 8.9, 0.99, x=9.8 if frame_index == 10 else 9.0,
+            in_occlusion_zone=True)
+        decisions = selector.select(players + [referee], frame_index)
+    assert not decisions[99].active
+    assert len(_active(decisions, TrackSide.FAR)) == 6
+
+
+def test_six_player_invariant_includes_hidden_members() -> None:
+    selector = ActivePlayerSelector(
+        VolleyballCourtConfiguration(),
+        ActivePlayerSelectorConfig(active_confirmation_frames=2),
+    )
+    established = [_candidate(index, 5.0) for index in range(6)]
+    selector.select(established, 0)
+    selector.select(established, 1)
+    for frame_index in range(2, 12):
+        visible = established[1:] + [
+            _candidate(100 + index, 5.0, 0.99) for index in range(4)
+        ]
+        decisions = selector.select(visible, frame_index)
+        assert len(_active(decisions, TrackSide.FAR)) <= 6
 
 
 def test_net_hysteresis_prevents_rapid_side_flipping() -> None:

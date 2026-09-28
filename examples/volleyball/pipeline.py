@@ -12,7 +12,7 @@ import numpy as np
 import supervision as sv
 
 from sports.annotators.volleyball import draw_player_tracks_on_volleyball_court
-from sports.common.calibration import CourtCalibration
+from sports.common.calibration import CourtCalibration, ImageOcclusionZone
 from sports.common.view import get_bottom_center_points
 from sports.configs.volleyball import CameraView, Point, VolleyballCourtConfiguration
 
@@ -25,6 +25,7 @@ try:
         PlayerSelection,
         TrackCandidate,
         TrackSide,
+        VisibilityState,
     )
 except ImportError:  # Support direct execution from examples/volleyball.
     from calibration import draw_projected_court
@@ -35,6 +36,7 @@ except ImportError:  # Support direct execution from examples/volleyball.
         PlayerSelection,
         TrackCandidate,
         TrackSide,
+        VisibilityState,
     )
 
 
@@ -43,6 +45,7 @@ CSV_COLUMNS = (
     "frame_index",
     "timestamp_s",
     "track_id",
+    "logical_player_track_id",
     "confidence",
     "bbox_x1",
     "bbox_y1",
@@ -52,12 +55,22 @@ CSV_COLUMNS = (
     "foot_y_px",
     "court_x_m",
     "court_y_m",
+    "court_x_m_predicted",
+    "court_y_m_predicted",
+    "last_known_court_x_m",
+    "last_known_court_y_m",
     "inside_court",
     "inside_analysis_area",
     "side",
     "active_player",
     "active_rank",
     "active_score",
+    "visible",
+    "occluded",
+    "position_observed",
+    "visibility_state",
+    "occlusion_age_frames",
+    "occlusion_evidence",
 )
 
 
@@ -76,6 +89,9 @@ class PipelineOptions:
     show_all_tracks: bool = False
     net_hysteresis_m: float = 0.5
     side_switch_frames: int = 5
+    active_occlusion_grace_frames: Optional[int] = None
+    show_occluded_players: bool = False
+    show_occlusion_zones: bool = False
 
 
 @dataclass
@@ -92,6 +108,13 @@ class _PipelineDiagnostics:
     removed_candidate_instances: int = 0
     unique_raw_ids: Set[int] = field(default_factory=set)
     unique_active_ids: Set[int] = field(default_factory=set)
+    temporary_occlusion_events: int = 0
+    restored_after_occlusion: int = 0
+    active_slots_replaced_during_grace: int = 0
+    disappearances_in_zones: int = 0
+    completed_occlusion_durations: List[int] = field(default_factory=list)
+    _previous_occluded: Set[int] = field(default_factory=set)
+    _last_occlusion_age: Dict[int, int] = field(default_factory=dict)
 
     def observe(
         self,
@@ -99,9 +122,11 @@ class _PipelineDiagnostics:
         decisions: Dict[int, PlayerSelection],
     ) -> None:
         far_candidates = sum(
-            decision.side is TrackSide.FAR for decision in decisions.values())
+            decision.side is TrackSide.FAR and decision.position_observed
+            for decision in decisions.values())
         near_candidates = sum(
-            decision.side is TrackSide.NEAR for decision in decisions.values())
+            decision.side is TrackSide.NEAR and decision.position_observed
+            for decision in decisions.values())
         active_far = sum(
             decision.side is TrackSide.FAR and decision.active
             for decision in decisions.values())
@@ -109,7 +134,8 @@ class _PipelineDiagnostics:
             decision.side is TrackSide.NEAR and decision.active
             for decision in decisions.values())
         self.raw_counts.append(len(raw_ids))
-        self.candidate_counts.append(len(decisions))
+        self.candidate_counts.append(sum(
+            decision.position_observed for decision in decisions.values()))
         self.active_counts.append(active_far + active_near)
         self.capped_far_frames += int(far_candidates > 6)
         self.capped_near_frames += int(near_candidates > 6)
@@ -117,10 +143,34 @@ class _PipelineDiagnostics:
         self.six_near_frames += int(active_near == 6)
         self.under_six_far_frames += int(active_far < 6)
         self.under_six_near_frames += int(active_near < 6)
-        self.removed_candidate_instances += len(decisions) - active_far - active_near
+        visible_active = sum(
+            decision.active and decision.position_observed
+            for decision in decisions.values())
+        self.removed_candidate_instances += (
+            self.candidate_counts[-1] - visible_active)
         self.unique_raw_ids.update(raw_ids)
         self.unique_active_ids.update(
             track_id for track_id, decision in decisions.items() if decision.active)
+        current_occluded = {
+            track_id for track_id, decision in decisions.items()
+            if decision.active and decision.occluded
+        }
+        entered = current_occluded - self._previous_occluded
+        self.temporary_occlusion_events += len(entered)
+        self.disappearances_in_zones += sum(
+            decisions[track_id].occlusion_evidence == "static_zone"
+            for track_id in entered)
+        restored = {
+            track_id for track_id in self._previous_occluded
+            if track_id in decisions and decisions[track_id].visible
+        }
+        self.restored_after_occlusion += len(restored)
+        for track_id in current_occluded:
+            self._last_occlusion_age[track_id] = decisions[track_id].occlusion_age
+        ended = self._previous_occluded - current_occluded
+        self.completed_occlusion_durations.extend(
+            self._last_occlusion_age.pop(track_id, 0) for track_id in ended)
+        self._previous_occluded = current_occluded
 
     def log(self, frames: int) -> None:
         median_raw = float(np.median(self.raw_counts)) if self.raw_counts else 0.0
@@ -147,6 +197,24 @@ class _PipelineDiagnostics:
         LOGGER.info(
             "Candidate instances removed by selector: %d",
             self.removed_candidate_instances)
+        durations = [
+            *self.completed_occlusion_durations,
+            *self._last_occlusion_age.values(),
+        ]
+        LOGGER.info("Temporary occlusion events: %d", self.temporary_occlusion_events)
+        LOGGER.info(
+            "Occlusion duration frames: average=%.1f, maximum=%d",
+            float(np.mean(durations)) if durations else 0.0,
+            max(durations, default=0),
+        )
+        LOGGER.info(
+            "Players restored after occlusion: %d", self.restored_after_occlusion)
+        LOGGER.info(
+            "Active slots replaced during grace: %d",
+            self.active_slots_replaced_during_grace)
+        LOGGER.info(
+            "Tracks disappearing inside static occlusion zones: %d",
+            self.disappearances_in_zones)
 
 
 def _video_writer(path: Path, fps: float, size: Tuple[int, int]) -> cv2.VideoWriter:
@@ -165,8 +233,19 @@ def _annotate_source(
     config: VolleyballCourtConfiguration,
     show_detections: bool,
     show_track_ids: bool,
+    decisions: Dict[int, PlayerSelection],
+    show_occluded_players: bool,
+    show_occlusion_zones: bool,
 ) -> np.ndarray:
     annotated = draw_projected_court(frame, calibration, config)
+    if show_occlusion_zones:
+        for zone in calibration.image_occlusion_zones:
+            polygon = np.rint(zone.points).astype(np.int32)
+            cv2.polylines(annotated, [polygon], True, (255, 0, 255), 2, cv2.LINE_AA)
+            anchor = tuple(polygon[0])
+            cv2.putText(
+                annotated, f"OCCLUSION: {zone.name}", anchor,
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 0, 255), 2, cv2.LINE_AA)
     tracker_ids = detections.tracker_id
     for index, box in enumerate(detections.xyxy):
         x1, y1, x2, y2 = np.rint(box).astype(int)
@@ -176,10 +255,41 @@ def _annotate_source(
                 annotated, (int(round((x1 + x2) / 2)), y2), 4,
                 (0, 255, 255), thickness=-1)
         if show_track_ids and tracker_ids is not None:
+            track_id = int(tracker_ids[index])
+            decision = decisions.get(track_id)
+            state = (
+                "ACTIVE" if decision is not None and decision.active
+                else "REJECTED" if decision is not None
+                else "RAW"
+            )
             cv2.putText(
-                annotated, f"ID {int(tracker_ids[index])}", (x1, max(20, y1 - 8)),
+                annotated, f"ID {track_id} {state}", (x1, max(20, y1 - 8)),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2, cv2.LINE_AA)
+    if show_occluded_players:
+        for track_id, decision in decisions.items():
+            if not decision.active or decision.position_observed:
+                continue
+            if decision.last_known_bbox is None:
+                continue
+            x1, y1, x2, y2 = np.rint(decision.last_known_bbox).astype(int)
+            cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 255), 2)
+            cv2.putText(
+                annotated, f"ID {track_id} {decision.visibility.value.upper()}",
+                (x1, max(20, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                (0, 255, 255), 2, cv2.LINE_AA)
     return annotated
+
+
+def _bbox_touches_zone(box: np.ndarray, zone: ImageOcclusionZone) -> bool:
+    """Return whether representative points of a bbox intersect a static polygon."""
+    x1, y1, x2, y2 = (float(value) for value in box)
+    polygon = np.asarray(zone.points, dtype=np.float32)
+    samples = (
+        (x1, y1), (x2, y1), (x2, y2), (x1, y2),
+        ((x1 + x2) / 2.0, (y1 + y2) / 2.0),
+        ((x1 + x2) / 2.0, y2),
+    )
+    return any(cv2.pointPolygonTest(polygon, point, False) >= 0 for point in samples)
 
 
 def _combined_tactical_size(
@@ -264,7 +374,17 @@ def run_pipeline(
         config=ActivePlayerSelectorConfig(
             net_hysteresis_m=options.net_hysteresis_m,
             side_switch_frames=options.side_switch_frames,
+            active_occlusion_grace_frames=(
+                options.active_occlusion_grace_frames
+                if options.active_occlusion_grace_frames is not None
+                else max(1, int(round(fps)))
+            ),
         ),
+    )
+    LOGGER.info(
+        "Active-player occlusion grace: %d frames (%.2f s)",
+        selector.config.active_occlusion_grace_frames,
+        selector.config.active_occlusion_grace_frames / fps,
     )
     diagnostics = _PipelineDiagnostics([], [], [])
     written_frames = 0
@@ -315,11 +435,22 @@ def run_pipeline(
                             court_point=court_point,
                             confidence=confidence if np.isfinite(confidence) else 0.0,
                             inside_court=inside_court,
+                            bbox=tuple(float(value) for value in box),
+                            in_occlusion_zone=any(
+                                _bbox_touches_zone(box, zone)
+                                for zone in calibration.image_occlusion_zones),
                         ))
 
-                decisions = selector.select(candidates, frame_index)
+                decisions = selector.select(
+                    candidates,
+                    frame_index,
+                    occluder_bboxes=tuple(
+                        tuple(float(value) for value in box)
+                        for box in detections.xyxy),
+                )
                 current_players: Dict[int, Point] = {}
                 inactive_players: Dict[int, Point] = {}
+                occluded_players: Dict[int, Point] = {}
                 for record in raw_records:
                     (track_id, court_point, foot_point, confidence, box,
                      inside_court, inside_analysis) = record
@@ -333,6 +464,7 @@ def run_pipeline(
                         "frame_index": frame_index,
                         "timestamp_s": f"{timestamp_s:.6f}",
                         "track_id": track_id,
+                        "logical_player_track_id": track_id,
                         "confidence": f"{confidence:.6f}",
                         "bbox_x1": f"{box[0]:.3f}",
                         "bbox_y1": f"{box[1]:.3f}",
@@ -342,6 +474,10 @@ def run_pipeline(
                         "foot_y_px": f"{foot_point[1]:.3f}",
                         "court_x_m": f"{court_point[0]:.6f}",
                         "court_y_m": f"{court_point[1]:.6f}",
+                        "court_x_m_predicted": "",
+                        "court_y_m_predicted": "",
+                        "last_known_court_x_m": f"{court_point[0]:.6f}",
+                        "last_known_court_y_m": f"{court_point[1]:.6f}",
                         "inside_court": inside_court,
                         "inside_analysis_area": inside_analysis,
                         "side": (
@@ -353,13 +489,60 @@ def run_pipeline(
                             else ""),
                         "active_score": (
                             f"{decision.score:.6f}" if decision is not None else ""),
+                        "visible": True,
+                        "occluded": False,
+                        "position_observed": True,
+                        "visibility_state": VisibilityState.VISIBLE.value,
+                        "occlusion_age_frames": 0,
+                        "occlusion_evidence": "",
+                    })
+
+                for track_id, decision in decisions.items():
+                    if not decision.active or decision.position_observed:
+                        continue
+                    last_point = decision.last_known_court_point
+                    if last_point is not None:
+                        occluded_players[track_id] = last_point
+                    csv_writer.writerow({
+                        "frame_index": frame_index,
+                        "timestamp_s": f"{timestamp_s:.6f}",
+                        "track_id": track_id,
+                        "logical_player_track_id": track_id,
+                        "confidence": "",
+                        "bbox_x1": "",
+                        "bbox_y1": "",
+                        "bbox_x2": "",
+                        "bbox_y2": "",
+                        "foot_x_px": "",
+                        "foot_y_px": "",
+                        "court_x_m": "",
+                        "court_y_m": "",
+                        "court_x_m_predicted": "",
+                        "court_y_m_predicted": "",
+                        "last_known_court_x_m": (
+                            f"{last_point[0]:.6f}" if last_point is not None else ""),
+                        "last_known_court_y_m": (
+                            f"{last_point[1]:.6f}" if last_point is not None else ""),
+                        "inside_court": "",
+                        "inside_analysis_area": "",
+                        "side": decision.side.value,
+                        "active_player": True,
+                        "active_rank": decision.rank or "",
+                        "active_score": f"{decision.score:.6f}",
+                        "visible": False,
+                        "occluded": decision.occluded,
+                        "position_observed": False,
+                        "visibility_state": decision.visibility.value,
+                        "occlusion_age_frames": decision.occlusion_age,
+                        "occlusion_evidence": decision.occlusion_evidence or "",
                     })
 
                 diagnostics.observe(set(int(value) for value in tracker_ids), decisions)
 
                 annotated = _annotate_source(
                     frame, detections, calibration, config,
-                    options.show_detections, options.show_track_ids)
+                    options.show_detections, options.show_track_ids, decisions,
+                    options.show_occluded_players, options.show_occlusion_zones)
                 tactical = draw_player_tracks_on_volleyball_court(
                     config=config,
                     player_points=current_players,
@@ -371,6 +554,8 @@ def run_pipeline(
                     camera_view=options.camera_view,
                     inactive_player_points=(
                         inactive_players if options.show_all_tracks else None),
+                    occluded_player_points=(
+                        occluded_players if options.show_occluded_players else None),
                 )
                 combined = _combine_frames(annotated, tactical)
                 writers[0].write(annotated)

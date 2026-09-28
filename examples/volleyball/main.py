@@ -115,6 +115,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--side-switch-frames", type=int, default=5,
         help="Consecutive beyond-band frames required to change sides (default: 5)")
+    parser.add_argument(
+        "--active-occlusion-grace-frames", type=int,
+        help=("Frames for which an established invisible player reserves an active "
+              "slot (default: source FPS, approximately 1 second)"))
+    parser.add_argument(
+        "--show-occluded-players", action="store_true",
+        help="Draw uncertain last-known positions as hollow debug markers")
+    parser.add_argument(
+        "--show-occlusion-zones", action="store_true",
+        help="Draw configured camera-space obstruction polygons")
     parser.add_argument("--show-calibration", action="store_true")
     parser.add_argument(
         "--debug", action="store_true", help="Show tracebacks for source errors")
@@ -155,6 +165,9 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--net-hysteresis cannot be negative.")
     if args.side_switch_frames <= 0:
         raise ValueError("--side-switch-frames must be positive.")
+    if (args.active_occlusion_grace_frames is not None
+            and args.active_occlusion_grace_frames < 0):
+        raise ValueError("--active-occlusion-grace-frames cannot be negative.")
 
 
 def resolve_camera_view(
@@ -271,6 +284,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         show_all_tracks=args.show_all_tracks,
         net_hysteresis_m=args.net_hysteresis,
         side_switch_frames=args.side_switch_frames,
+        active_occlusion_grace_frames=args.active_occlusion_grace_frames,
+        show_occluded_players=args.show_occluded_players,
+        show_occlusion_zones=args.show_occlusion_zones,
     )
     frame_count = run_pipeline(
         source_video=source_video,

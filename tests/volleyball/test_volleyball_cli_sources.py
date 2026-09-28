@@ -40,6 +40,17 @@ def test_cli_accepts_player_inference_controls() -> None:
     assert args.device == "auto"
 
 
+def test_cli_accepts_occlusion_debug_controls() -> None:
+    args = build_parser().parse_args([
+        "--source-video", "match.mp4", "--output-dir", "out",
+        "--active-occlusion-grace-frames", "45",
+        "--show-occluded-players", "--show-occlusion-zones",
+    ])
+    assert args.active_occlusion_grace_frames == 45
+    assert args.show_occluded_players
+    assert args.show_occlusion_zones
+
+
 def test_cli_accepts_youtube_url() -> None:
     args = build_parser().parse_args(
         ["--youtube-url", "https://youtu.be/abc123", *BASE_ARGS]

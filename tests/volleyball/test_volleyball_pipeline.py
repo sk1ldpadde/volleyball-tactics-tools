@@ -98,6 +98,10 @@ def test_synthetic_video_runs_through_complete_pipeline(
     assert {int(row["frame_index"]) for row in rows}.issubset(set(range(5)))
     assert all(row["side"] in {"far", "near", "unknown"} for row in rows)
     assert all(row["active_player"] in {"True", "False"} for row in rows)
+    assert all(row["logical_player_track_id"] == row["track_id"] for row in rows)
+    assert all(row["visible"] == "True" for row in rows)
+    assert all(row["position_observed"] == "True" for row in rows)
+    assert all(row["visibility_state"] == "visible" for row in rows)
     active_by_frame_side = {}
     for row in rows:
         if row["active_player"] == "True":

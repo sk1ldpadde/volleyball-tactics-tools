@@ -314,6 +314,39 @@ The tactical and combined outputs show selected active players by default. Add
 markers. Active players remain the larger colored markers. Side stability can be tuned
 with `--net-hysteresis` (default `0.5 m`) and `--side-switch-frames` (default `5`).
 
+### Referee and foreground occlusion
+
+Active membership is separate from current visibility. After a track has been selected
+consistently, a detector dropout reserves its side's slot for approximately one second
+(the source FPS) by default. Override this with
+`--active-occlusion-grace-frames`. The invariant includes hidden members:
+`visible active + occluded/lost active <= 6` on each side.
+
+Normal tactical output draws only measured positions. Add
+`--show-occluded-players` to draw a hollow yellow marker at an invisible member's
+last-known position; this is explicitly an uncertain historical position, not a current
+measurement or motion prediction. `player_tracks.csv` keeps observed metric columns
+empty for these membership-only rows and records `visible`, `occluded`,
+`position_observed`, `visibility_state`, `occlusion_age_frames`, and
+`occlusion_evidence` separately.
+
+Fixed camera obstructions can be described in calibration JSON using image-pixel
+coordinates tied to that camera view:
+
+```json
+"image_occlusion_zones": [
+  {
+    "name": "referee_stand",
+    "points": [[1410, 310], [1580, 310], [1620, 970], [1390, 970]]
+  }
+]
+```
+
+Each polygon needs at least three finite points. Use `--show-occlusion-zones` to draw
+them in the annotated video. A zone is evidence for temporary occlusion and a
+long-stationary net-side official; it is not an exclusion mask. The MVP stores and
+validates manually authored polygons but does not yet provide an interactive zone UI.
+
 ## Outputs
 
 Every output directory contains:
@@ -321,7 +354,8 @@ Every output directory contains:
 - `calibration.json` — v2 named correspondences and recomputed fit diagnostics;
 - `player_tracks.csv` — every raw tracked person with frame, timestamp, temporary ID,
   confidence, box, pixel foot point, metric court point, court/analysis-area flags,
-  canonical `side`, `active_player`, `active_rank`, and `active_score`;
+  canonical `side`, `active_player`, `active_rank`, `active_score`, raw and logical IDs,
+  and observed/occluded visibility state;
 - `annotated.mp4` — camera view with calibrated lines, boxes, foot points, and IDs;
 - `tactical.mp4` — full tactical court with optional trajectory tails;
 - `combined.mp4` — synchronized annotated and tactical frames side by side.
@@ -353,11 +387,16 @@ visible.
 The active-player layer uses canonical court coordinates, never screen position:
 `FAR` is primarily `y < 9 m`, and `NEAR` is primarily `y > 9 m`. A per-track hysteresis
 state prevents noisy foot anchors near the net from flipping side every frame. Within
-each side, at most six current tracks are selected using named weights for detection
+each side, at most six logical members are selected using named weights for detection
 confidence, track age, recent active membership, selection history, and proximity to
-the playable court. Missing players are not invented; recent membership is remembered
-briefly so a returning established track can displace a transient official. This is a
-domain plausibility filter, not team or player identity classification.
+the playable court. Missing positions are not invented. Confirmed membership is
+remembered through a short dropout, and a hidden incumbent reserves its slot so a
+transient official or spectator cannot immediately replace it. Person-box overlap and
+fixed obstruction zones distinguish likely `occluded` from unexplained `lost` state.
+A long-lived track with an extremely small movement footprint beside the net or inside
+an obstruction zone receives a referee-suspicion penalty; stability alone therefore
+cannot prove that it is a player. This is a domain plausibility filter, not team or
+player identity classification.
 
 ## Hardware and known limitations
 
@@ -367,6 +406,10 @@ domain plausibility filter, not team or player identity classification.
   can detect officials or spectators. Geometry removes only people whose projected foot
   point falls outside the configured area; the max-six selector cannot determine which
   six are correct when several plausible people occupy one side.
+- Automatic reconnection across a changed ByteTrack ID is deferred. The CSV includes a
+  `logical_player_track_id` seam, but it equals the raw tracker ID in this version.
+- Static occlusion polygons are camera-specific and must be authored manually in the
+  saved calibration JSON. Camera movement invalidates both calibration and zones.
 - If `yolo26s @ 960` or `yolo26m @ 960` still misses real players, a small
   volleyball-specific fine-tune is preferable to continuing through larger generic COCO
   weights. Model size alone does not close a domain gap.

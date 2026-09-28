@@ -24,6 +24,32 @@ DEFAULT_RANSAC_THRESHOLD_M = 0.15
 
 
 @dataclass(frozen=True)
+class ImageOcclusionZone:
+    """Named camera-space polygon describing a fixed foreground obstruction."""
+
+    name: str
+    points: Tuple[Tuple[float, float], ...]
+
+    def __post_init__(self) -> None:
+        if not self.name.strip():
+            raise ValueError("Image occlusion zone name cannot be empty.")
+        if len(self.points) < 3:
+            raise ValueError(
+                f"Image occlusion zone '{self.name}' needs at least 3 points.")
+        normalized = tuple((float(point[0]), float(point[1])) for point in self.points)
+        if not np.isfinite(normalized).all():
+            raise ValueError(
+                f"Image occlusion zone '{self.name}' must contain finite points.")
+        object.__setattr__(self, "points", normalized)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "name": self.name,
+            "points": [[float(x), float(y)] for x, y in self.points],
+        }
+
+
+@dataclass(frozen=True)
 class CalibrationFit:
     """Quality diagnostics for an image-to-court homography."""
 
@@ -77,6 +103,7 @@ class CourtCalibration:
     court_width_m: float
     court_length_m: float
     camera_view: CameraView
+    image_occlusion_zones: Tuple[ImageOcclusionZone, ...]
     ransac_threshold_m: float
     version: int
     fit: CalibrationFit
@@ -91,6 +118,7 @@ class CourtCalibration:
         court_width_m: float = 9.0,
         court_length_m: float = 18.0,
         camera_view: Union[CameraView, str] = CameraView.ENDLINE,
+        image_occlusion_zones: Optional[Tuple[ImageOcclusionZone, ...]] = None,
         ransac_threshold_m: float = DEFAULT_RANSAC_THRESHOLD_M,
         version: int = 2,
     ) -> None:
@@ -111,6 +139,9 @@ class CourtCalibration:
             raise ValueError(
                 f"Unsupported camera view: {camera_view!r}. Expected endline or sideline."
             ) from exc
+        zones = tuple(image_occlusion_zones or ())
+        if len({zone.name for zone in zones}) != len(zones):
+            raise ValueError("Image occlusion zone names must be unique.")
 
         normalized = self._normalize_landmarks(raw_points)
         if len(normalized) < 4:
@@ -147,6 +178,7 @@ class CourtCalibration:
         object.__setattr__(self, "court_width_m", float(court_width_m))
         object.__setattr__(self, "court_length_m", float(court_length_m))
         object.__setattr__(self, "camera_view", normalized_camera_view)
+        object.__setattr__(self, "image_occlusion_zones", zones)
         object.__setattr__(self, "ransac_threshold_m", float(ransac_threshold_m))
         object.__setattr__(self, "version", 2)
         object.__setattr__(self, "fit", fit)
@@ -250,6 +282,9 @@ class CourtCalibration:
             "court_width_m": self.court_width_m,
             "court_length_m": self.court_length_m,
             "camera_view": self.camera_view.value,
+            "image_occlusion_zones": [
+                zone.to_dict() for zone in self.image_occlusion_zones
+            ],
             "ransac_threshold_m": self.ransac_threshold_m,
             "landmarks": {
                 name: [float(value) for value in point]
@@ -273,6 +308,21 @@ class CourtCalibration:
         raw_points = data.get(key)
         if not isinstance(raw_points, Mapping):
             raise ValueError(f"Calibration {key} must be an object.")
+        raw_zones = data.get("image_occlusion_zones", [])
+        if not isinstance(raw_zones, list):
+            raise ValueError("Calibration image_occlusion_zones must be a list.")
+        zones = []
+        for raw_zone in raw_zones:
+            if not isinstance(raw_zone, Mapping):
+                raise ValueError("Each image occlusion zone must be an object.")
+            raw_zone_points = raw_zone.get("points")
+            if not isinstance(raw_zone_points, list):
+                raise ValueError("Image occlusion zone points must be a list.")
+            zones.append(ImageOcclusionZone(
+                name=str(raw_zone.get("name", "")),
+                points=tuple(
+                    (float(point[0]), float(point[1])) for point in raw_zone_points),
+            ))
         return cls(
             landmarks={
                 str(name): (float(point[0]), float(point[1]))
@@ -282,6 +332,7 @@ class CourtCalibration:
             court_width_m=float(data.get("court_width_m", 9.0)),
             court_length_m=float(data.get("court_length_m", 18.0)),
             camera_view=str(data.get("camera_view", CameraView.ENDLINE.value)),
+            image_occlusion_zones=tuple(zones),
             ransac_threshold_m=float(
                 data.get("ransac_threshold_m", DEFAULT_RANSAC_THRESHOLD_M)),
             version=version,
