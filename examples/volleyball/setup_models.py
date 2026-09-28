@@ -22,7 +22,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--models-dir", type=Path, default=Path("models/ultralytics"))
     parser.add_argument("--device", default="auto", help="auto, cpu, cuda:0, or mps")
-    parser.add_argument("--image-size", type=int, default=640)
+    parser.add_argument(
+        "--player-imgsz", "--image-size", dest="player_imgsz", type=int,
+        choices=(640, 960, 1280), default=640)
     parser.add_argument("--debug", action="store_true")
     return parser
 
@@ -41,7 +43,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             requested_device=args.device,
         )
         detector = UltralyticsPlayerDetector(
-            resolved.path, device=resolved.device, image_size=args.image_size)
+            resolved.path, device=resolved.device, image_size=args.player_imgsz)
         detections = detector.detect(np.zeros((640, 640, 3), dtype=np.uint8))
         if detector.task != "detect":
             raise ModelSetupError(

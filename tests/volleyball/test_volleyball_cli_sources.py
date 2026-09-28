@@ -26,6 +26,17 @@ def test_cli_defaults_to_auto_player_model() -> None:
         ["--source-video", "match.mp4", "--output-dir", "output"])
 
     assert args.player_model == "auto"
+    assert args.player_imgsz == 640
+    assert args.player_conf == 0.25
+
+
+def test_cli_accepts_player_inference_controls() -> None:
+    args = build_parser().parse_args([
+        "--source-video", "match.mp4", "--output-dir", "out",
+        "--player-imgsz", "960", "--player-conf", "0.4",
+    ])
+    assert args.player_imgsz == 960
+    assert args.player_conf == 0.4
     assert args.device == "auto"
 
 

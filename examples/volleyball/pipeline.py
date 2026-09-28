@@ -2,10 +2,10 @@
 
 from collections import defaultdict, deque
 import csv
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import logging
 from pathlib import Path
-from typing import Deque, Dict, Optional, Tuple
+from typing import Deque, Dict, List, Optional, Set, Tuple
 
 import cv2
 import numpy as np
@@ -19,9 +19,23 @@ from sports.configs.volleyball import CameraView, Point, VolleyballCourtConfigur
 try:
     from .calibration import draw_projected_court
     from .detection import PlayerDetector
+    from .selection import (
+        ActivePlayerSelector,
+        ActivePlayerSelectorConfig,
+        PlayerSelection,
+        TrackCandidate,
+        TrackSide,
+    )
 except ImportError:  # Support direct execution from examples/volleyball.
     from calibration import draw_projected_court
     from detection import PlayerDetector
+    from selection import (
+        ActivePlayerSelector,
+        ActivePlayerSelectorConfig,
+        PlayerSelection,
+        TrackCandidate,
+        TrackSide,
+    )
 
 
 LOGGER = logging.getLogger(__name__)
@@ -40,6 +54,10 @@ CSV_COLUMNS = (
     "court_y_m",
     "inside_court",
     "inside_analysis_area",
+    "side",
+    "active_player",
+    "active_rank",
+    "active_score",
 )
 
 
@@ -55,6 +73,80 @@ class PipelineOptions:
     show_track_ids: bool = True
     preview_tactical_view: bool = False
     camera_view: CameraView = CameraView.ENDLINE
+    show_all_tracks: bool = False
+    net_hysteresis_m: float = 0.5
+    side_switch_frames: int = 5
+
+
+@dataclass
+class _PipelineDiagnostics:
+    raw_counts: List[int]
+    candidate_counts: List[int]
+    active_counts: List[int]
+    capped_far_frames: int = 0
+    capped_near_frames: int = 0
+    six_far_frames: int = 0
+    six_near_frames: int = 0
+    under_six_far_frames: int = 0
+    under_six_near_frames: int = 0
+    removed_candidate_instances: int = 0
+    unique_raw_ids: Set[int] = field(default_factory=set)
+    unique_active_ids: Set[int] = field(default_factory=set)
+
+    def observe(
+        self,
+        raw_ids: Set[int],
+        decisions: Dict[int, PlayerSelection],
+    ) -> None:
+        far_candidates = sum(
+            decision.side is TrackSide.FAR for decision in decisions.values())
+        near_candidates = sum(
+            decision.side is TrackSide.NEAR for decision in decisions.values())
+        active_far = sum(
+            decision.side is TrackSide.FAR and decision.active
+            for decision in decisions.values())
+        active_near = sum(
+            decision.side is TrackSide.NEAR and decision.active
+            for decision in decisions.values())
+        self.raw_counts.append(len(raw_ids))
+        self.candidate_counts.append(len(decisions))
+        self.active_counts.append(active_far + active_near)
+        self.capped_far_frames += int(far_candidates > 6)
+        self.capped_near_frames += int(near_candidates > 6)
+        self.six_far_frames += int(active_far == 6)
+        self.six_near_frames += int(active_near == 6)
+        self.under_six_far_frames += int(active_far < 6)
+        self.under_six_near_frames += int(active_near < 6)
+        self.removed_candidate_instances += len(decisions) - active_far - active_near
+        self.unique_raw_ids.update(raw_ids)
+        self.unique_active_ids.update(
+            track_id for track_id, decision in decisions.items() if decision.active)
+
+    def log(self, frames: int) -> None:
+        median_raw = float(np.median(self.raw_counts)) if self.raw_counts else 0.0
+        median_candidates = (
+            float(np.median(self.candidate_counts)) if self.candidate_counts else 0.0)
+        median_active = (
+            float(np.median(self.active_counts)) if self.active_counts else 0.0)
+        LOGGER.info("Player-selection diagnostics (%d frames)", frames)
+        LOGGER.info("Median raw tracks/frame: %.1f", median_raw)
+        LOGGER.info("Median analysis candidates/frame: %.1f", median_candidates)
+        LOGGER.info("Median active players/frame: %.1f", median_active)
+        LOGGER.info(
+            "Frames capped before selection: FAR=%d, NEAR=%d",
+            self.capped_far_frames, self.capped_near_frames)
+        LOGGER.info(
+            "Frames with exactly 6 active: FAR=%d, NEAR=%d",
+            self.six_far_frames, self.six_near_frames)
+        LOGGER.info(
+            "Frames with fewer than 6 active: FAR=%d, NEAR=%d",
+            self.under_six_far_frames, self.under_six_near_frames)
+        LOGGER.info(
+            "Unique IDs: raw=%d, active=%d",
+            len(self.unique_raw_ids), len(self.unique_active_ids))
+        LOGGER.info(
+            "Candidate instances removed by selector: %d",
+            self.removed_candidate_instances)
 
 
 def _video_writer(path: Path, fps: float, size: Tuple[int, int]) -> cv2.VideoWriter:
@@ -167,6 +259,14 @@ def run_pipeline(
     transformer = calibration.create_transformer()
     trajectories: Dict[int, Deque[Point]] = defaultdict(
         lambda: deque(maxlen=max(1, options.trajectory_length)))
+    selector = ActivePlayerSelector(
+        court=config,
+        config=ActivePlayerSelectorConfig(
+            net_hysteresis_m=options.net_hysteresis_m,
+            side_switch_frames=options.side_switch_frames,
+        ),
+    )
+    diagnostics = _PipelineDiagnostics([], [], [])
     written_frames = 0
 
     try:
@@ -185,37 +285,50 @@ def run_pipeline(
                 if options.max_frames is not None and written_frames >= options.max_frames:
                     break
 
-                detections = detector.detect(frame)
-                detected_feet = get_bottom_center_points(detections.xyxy)
-                detected_court = transformer.transform_points(detected_feet)
-                analysis_mask = np.asarray(
-                    [config.is_inside_analysis_area(tuple(point)) for point in detected_court],
-                    dtype=bool,
-                )
-                detections = detections[analysis_mask]
-                detections = tracker.update_with_detections(detections)
+                detections = tracker.update_with_detections(detector.detect(frame))
 
                 foot_points = get_bottom_center_points(detections.xyxy)
                 court_points = transformer.transform_points(foot_points)
-                current_players: Dict[int, Point] = {}
                 tracker_ids = detections.tracker_id
                 confidences = detections.confidence
                 if tracker_ids is None:
                     tracker_ids = np.empty((0,), dtype=int)
 
+                raw_records = []
+                candidates = []
                 for index, tracker_id_value in enumerate(tracker_ids):
                     track_id = int(tracker_id_value)
                     court_point = (float(court_points[index, 0]), float(court_points[index, 1]))
                     foot_point = foot_points[index]
                     inside_court = config.is_inside_court(court_point)
                     inside_analysis = config.is_inside_analysis_area(court_point)
-                    if not inside_analysis:
-                        continue
-                    current_players[track_id] = court_point
-                    trajectories[track_id].append(court_point)
                     confidence = (
                         float(confidences[index]) if confidences is not None else float("nan"))
                     box = detections.xyxy[index]
+                    raw_records.append((
+                        track_id, court_point, foot_point, confidence, box,
+                        inside_court, inside_analysis,
+                    ))
+                    if inside_analysis and np.isfinite(court_point).all():
+                        candidates.append(TrackCandidate(
+                            track_id=track_id,
+                            court_point=court_point,
+                            confidence=confidence if np.isfinite(confidence) else 0.0,
+                            inside_court=inside_court,
+                        ))
+
+                decisions = selector.select(candidates, frame_index)
+                current_players: Dict[int, Point] = {}
+                inactive_players: Dict[int, Point] = {}
+                for record in raw_records:
+                    (track_id, court_point, foot_point, confidence, box,
+                     inside_court, inside_analysis) = record
+                    decision = decisions.get(track_id)
+                    if decision is not None and decision.active:
+                        current_players[track_id] = court_point
+                        trajectories[track_id].append(court_point)
+                    elif decision is not None:
+                        inactive_players[track_id] = court_point
                     csv_writer.writerow({
                         "frame_index": frame_index,
                         "timestamp_s": f"{timestamp_s:.6f}",
@@ -231,7 +344,18 @@ def run_pipeline(
                         "court_y_m": f"{court_point[1]:.6f}",
                         "inside_court": inside_court,
                         "inside_analysis_area": inside_analysis,
+                        "side": (
+                            decision.side.value if decision is not None
+                            else TrackSide.UNKNOWN.value),
+                        "active_player": bool(decision and decision.active),
+                        "active_rank": (
+                            decision.rank if decision is not None and decision.rank is not None
+                            else ""),
+                        "active_score": (
+                            f"{decision.score:.6f}" if decision is not None else ""),
                     })
+
+                diagnostics.observe(set(int(value) for value in tracker_ids), decisions)
 
                 annotated = _annotate_source(
                     frame, detections, calibration, config,
@@ -245,6 +369,8 @@ def run_pipeline(
                     padding=options.tactical_padding,
                     include_free_zone=True,
                     camera_view=options.camera_view,
+                    inactive_player_points=(
+                        inactive_players if options.show_all_tracks else None),
                 )
                 combined = _combine_frames(annotated, tactical)
                 writers[0].write(annotated)
@@ -264,4 +390,5 @@ def run_pipeline(
         if options.preview_tactical_view:
             cv2.destroyAllWindows()
 
+    diagnostics.log(written_frames)
     return written_frames

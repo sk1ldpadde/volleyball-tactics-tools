@@ -96,3 +96,11 @@ def test_synthetic_video_runs_through_complete_pipeline(
     assert all(np.isfinite(float(row["court_x_m"])) for row in rows)
     assert all(np.isfinite(float(row["court_y_m"])) for row in rows)
     assert {int(row["frame_index"]) for row in rows}.issubset(set(range(5)))
+    assert all(row["side"] in {"far", "near", "unknown"} for row in rows)
+    assert all(row["active_player"] in {"True", "False"} for row in rows)
+    active_by_frame_side = {}
+    for row in rows:
+        if row["active_player"] == "True":
+            key = (row["frame_index"], row["side"])
+            active_by_frame_side[key] = active_by_frame_side.get(key, 0) + 1
+    assert all(count <= 6 for count in active_by_frame_side.values())

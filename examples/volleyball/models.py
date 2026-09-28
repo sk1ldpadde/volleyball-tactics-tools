@@ -10,7 +10,7 @@ from typing import Any, Literal, Optional, Tuple
 LOGGER = logging.getLogger(__name__)
 YOLO26_MINIMUM_VERSION = (8, 4, 0)
 OFFICIAL_MODEL_NAMES = {
-    "yolo26n.pt", "yolo26s.pt", "yolo11n.pt", "yolo11s.pt",
+    "yolo26n.pt", "yolo26s.pt", "yolo26m.pt", "yolo11n.pt", "yolo11s.pt",
 }
 
 
@@ -70,7 +70,7 @@ def choose_auto_model(ultralytics_version: str, device: str) -> str:
     """Choose the newest model family supported by the installed package."""
     generation = "yolo26" if _version_tuple(
         ultralytics_version) >= YOLO26_MINIMUM_VERSION else "yolo11"
-    scale = "s" if device.startswith("cuda") else "n"
+    scale = "s" if device.startswith("cuda") or device == "mps" else "n"
     return f"{generation}{scale}.pt"
 
 

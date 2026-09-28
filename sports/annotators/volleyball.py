@@ -181,6 +181,7 @@ def draw_player_tracks_on_volleyball_court(
     padding: int = 40,
     include_free_zone: bool = True,
     camera_view: CameraView = CameraView.ENDLINE,
+    inactive_player_points: Optional[Mapping[int, Point]] = None,
 ) -> np.ndarray:
     """Render current tracker positions and optional recent trajectory tails."""
     court = draw_volleyball_court(
@@ -196,6 +197,26 @@ def draw_player_tracks_on_volleyball_court(
                 camera_view=camera_view,
             )).astype(np.int32)
             cv2.polylines(court, [pixels], False, (180, 180, 180), 2, cv2.LINE_AA)
+
+    if inactive_player_points:
+        inactive_ids = list(inactive_player_points)
+        inactive_points = np.asarray(
+            [inactive_player_points[track_id] for track_id in inactive_ids],
+            dtype=np.float32,
+        )
+        court = draw_points_on_volleyball_court(
+            config=config,
+            points=inactive_points,
+            labels=[str(track_id) for track_id in inactive_ids],
+            court=court,
+            resolution_wh=resolution_wh,
+            padding=padding,
+            include_free_zone=include_free_zone,
+            face_color=(100, 100, 100),
+            edge_color=(190, 190, 190),
+            radius=6,
+            camera_view=camera_view,
+        )
 
     track_ids = list(player_points)
     points = np.asarray([player_points[track_id] for track_id in track_ids], dtype=np.float32)

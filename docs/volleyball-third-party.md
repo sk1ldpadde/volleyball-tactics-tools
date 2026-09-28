@@ -47,9 +47,11 @@ license. See <https://www.ultralytics.com/license>.
 No weights are committed or redistributed by this repository. In `auto` mode the
 application asks the official Ultralytics Python API for one allow-listed COCO
 detection checkpoint (`yolo26n.pt`, `yolo26s.pt`, or the YOLO11 compatibility
-equivalent) and stores it in the ignored `models/ultralytics/` directory. It does not
-construct arbitrary model URLs or use third-party mirrors. Ultralytics documents
-YOLO26 code and models under AGPL-3.0 or Enterprise terms:
+equivalent) and stores it in the ignored `models/ultralytics/` directory. The official
+`yolo26m.pt` detection checkpoint is also allow-listed for explicit benchmarking and
+selection, but is never chosen automatically. The application does not construct
+arbitrary model URLs or use third-party mirrors. Ultralytics documents YOLO26 code and
+models under AGPL-3.0 or Enterprise terms:
 <https://docs.ultralytics.com/models/yolo26/>.
 
 Automatic acquisition does not make the weights MIT-licensed. Users must verify:

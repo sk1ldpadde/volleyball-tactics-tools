@@ -44,6 +44,7 @@ class _DownloadingYolo:
 def test_auto_policy_uses_current_compatible_generation_and_hardware() -> None:
     assert choose_auto_model("8.4.0", "cpu") == "yolo26n.pt"
     assert choose_auto_model("8.4.163", "cuda:0") == "yolo26s.pt"
+    assert choose_auto_model("8.4.163", "mps") == "yolo26s.pt"
     assert choose_auto_model("8.3.99", "cpu") == "yolo11n.pt"
     assert select_device("auto", HardwareInfo("x", True, False)) == "cuda:0"
     assert select_device("auto", HardwareInfo("x", False, True)) == "mps"
@@ -82,6 +83,7 @@ class _FakePredictionModel:
     names = {0: "person", 1: "bicycle"}
 
     def predict(self, *_args, **_kwargs):
+        self.predict_kwargs = _kwargs
         boxes = SimpleNamespace(
             xyxy=_Tensor([[10.0, 20.0, 30.0, 80.0]]),
             conf=_Tensor([0.9]),
@@ -105,3 +107,4 @@ def test_detector_adapter_converts_person_result_and_bottom_center() -> None:
     np.testing.assert_allclose(detections.xyxy, [[10, 20, 30, 80]])
     assert detector.task == "detect"
     assert detector.class_names[0] == "person"
+    assert detector._model.predict_kwargs["imgsz"] == 640

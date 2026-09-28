@@ -16,6 +16,7 @@ The MVP:
   or a trusted local compatible checkpoint;
 - assigns temporary ByteTrack IDs;
 - retains positions inside configurable side/baseline analysis margins;
+- selects at most six temporally stable active tracks on each canonical court side;
 - writes annotated, tactical, and side-by-side MP4 files plus `player_tracks.csv`.
 
 It does **not** identify teams or people, detect the ball, segment rallies, recognize
@@ -32,6 +33,15 @@ Player Detector
   |
   v
 ByteTrack
+  |
+  v
+Raw tracks
+  |
+  v
+Court homography / analysis-area filter
+  |
+  v
+Temporal active-player selector (max 6 FAR + max 6 NEAR)
   |
   +------------------------+
   |                        |
@@ -85,10 +95,11 @@ Python versions pip may select an older yt-dlp release that no longer tracks You
 changes reliably.
 
 The default `--player-model auto` uses the installed Ultralytics version and hardware.
-Ultralytics 8.4.0 or newer selects YOLO26: `yolo26s.pt` on CUDA and `yolo26n.pt` on
-CPU or MPS. Older compatible installations fall back to the corresponding mature
-YOLO11 model. Only official nano/small detection names are eligible for automatic
-download, and weights are stored under `models/ultralytics/` (ignored by Git).
+Ultralytics 8.4.0 or newer selects YOLO26: `yolo26s.pt` on CUDA or MPS and
+`yolo26n.pt` on CPU. Older compatible installations fall back to the corresponding
+mature YOLO11 model. Official `yolo26n.pt`, `yolo26s.pt`, and `yolo26m.pt` detection
+weights may be requested explicitly; automatic selection never chooses medium, large,
+or extra-large. Weights are stored under `models/ultralytics/` (ignored by Git).
 
 Prepare and perform an actual inference smoke test before processing video:
 
@@ -99,9 +110,42 @@ python examples/volleyball/setup_models.py
 This reports Torch/Ultralytics versions, available CUDA/MPS hardware, the selected
 device and exact model path, then runs inference on a synthetic image and verifies
 that the model is a detection model with COCO class 0 named `person`. Use
-`--player-model yolo26n.pt` or `yolo26s.pt` for an explicit official choice. A custom
-checkpoint must be an existing local path. Only load custom PyTorch-compatible model
-files from a trusted source.
+`--player-model yolo26n.pt`, `yolo26s.pt`, or `yolo26m.pt` for an explicit official
+choice. A custom checkpoint must be an existing local path. Only load custom
+PyTorch-compatible model files from a trusted source.
+
+Inference resolution and the visible confidence threshold are controlled explicitly:
+
+```text
+--player-imgsz 640|960|1280   default: 640
+--player-conf FLOAT           default: 0.25
+```
+
+Higher resolution can help distant players but increases latency and memory use.
+The legacy aliases `--image-size` and `--confidence` remain accepted.
+
+### Reproducible detector benchmark
+
+Compare official models on the same sequential frames, excluding model load and one
+warm-up prediction from timing:
+
+```bash
+python examples/volleyball/benchmark_player_models.py \
+  --source-video /path/to/match.mov \
+  --calibration-file output/calibration.json \
+  --device mps \
+  --start-time 10 \
+  --frames 300 \
+  --models yolo26n.pt yolo26s.pt yolo26m.pt \
+  --player-imgsz 640 960 \
+  --output-csv output/player-model-benchmark.csv
+```
+
+The report includes mean/median inference latency, FPS, raw person counts,
+confidence, geometrically plausible analysis-area counts, and frames below/above 12
+plausible people. These are diagnostics rather than an accuracy leaderboard: detection
+count alone cannot establish which model found the correct players. The script uses
+official Ultralytics acquisition and never downloads `l`/`x` weights.
 
 Ultralytics software and its default trained weights are currently offered under
 AGPL-3.0 or a separate Enterprise license. That is distinct from this repository's MIT
@@ -265,13 +309,19 @@ Use `--show-detections` / `--hide-detections` and `--show-track-ids` /
 live combined preview; press `q` to stop. Processing and output generation do not
 otherwise require a display when a calibration file already exists.
 
+The tactical and combined outputs show selected active players by default. Add
+`--show-all-tracks` to draw rejected but geometrically eligible tracks as smaller gray
+markers. Active players remain the larger colored markers. Side stability can be tuned
+with `--net-hysteresis` (default `0.5 m`) and `--side-switch-frames` (default `5`).
+
 ## Outputs
 
 Every output directory contains:
 
 - `calibration.json` — v2 named correspondences and recomputed fit diagnostics;
-- `player_tracks.csv` — frame, timestamp, temporary ID, confidence, box, pixel foot
-  point, metric court point, and court/analysis-area membership;
+- `player_tracks.csv` — every raw tracked person with frame, timestamp, temporary ID,
+  confidence, box, pixel foot point, metric court point, court/analysis-area flags,
+  canonical `side`, `active_player`, `active_rank`, and `active_score`;
 - `annotated.mp4` — camera view with calibrated lines, boxes, foot points, and IDs;
 - `tactical.mp4` — full tactical court with optional trajectory tails;
 - `combined.mp4` — synchronized annotated and tactical frames side by side.
@@ -296,7 +346,18 @@ near-left (0,18) ------ (9,18) near-right
 
 The default analysis area extends 3 m past each sideline and 5 m past each baseline,
 so `x` may be `-3..12` and `y` may be `-5..23`. Adjust with `--side-margin` and
-`--baseline-margin`. No assumption is made that exactly 12 people are visible.
+`--baseline-margin`. Servers behind either baseline and pursuit players beyond a
+sideline remain eligible. Raw tracking makes no assumption that exactly 12 people are
+visible.
+
+The active-player layer uses canonical court coordinates, never screen position:
+`FAR` is primarily `y < 9 m`, and `NEAR` is primarily `y > 9 m`. A per-track hysteresis
+state prevents noisy foot anchors near the net from flipping side every frame. Within
+each side, at most six current tracks are selected using named weights for detection
+confidence, track age, recent active membership, selection history, and proximity to
+the playable court. Missing players are not invented; recent membership is remembered
+briefly so a returning established track can displace a transient official. This is a
+domain plausibility filter, not team or player identity classification.
 
 ## Hardware and known limitations
 
@@ -304,7 +365,11 @@ so `x` may be `-3..12` and `y` may be `-5..23`. Adjust with `--side-margin` and
   PyTorch/Ultralytics build.
 - Generic person weights can miss crouched, partially occluded, or distant players and
   can detect officials or spectators. Geometry removes only people whose projected foot
-  point falls outside the configured area.
+  point falls outside the configured area; the max-six selector cannot determine which
+  six are correct when several plausible people occupy one side.
+- If `yolo26s @ 960` or `yolo26m @ 960` still misses real players, a small
+  volleyball-specific fine-tune is preferable to continuing through larger generic COCO
+  weights. Model size alone does not close a domain gap.
 - A single planar homography is valid for floor contact points, not airborne bodies or
   balls. The bottom-center box anchor is only an approximation of foot contact.
 - Calibration becomes invalid after camera pan, zoom, stabilization crop, or relocation.

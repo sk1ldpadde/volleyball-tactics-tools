@@ -81,13 +81,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--calibration-file", type=Path,
         help="Reuse this JSON file; if absent, manual calibration is saved here.")
     parser.add_argument("--calibration-time", type=float, default=0.0)
-    parser.add_argument("--confidence", type=float, default=0.25)
+    parser.add_argument(
+        "--player-conf", "--confidence", dest="player_conf", type=float, default=0.25,
+        help="Person detection confidence threshold (default: 0.25)")
     parser.add_argument("--person-class-id", type=int, default=0)
     parser.add_argument("--device", default="auto", help="auto, cpu, cuda, cuda:0, or mps")
     parser.add_argument(
         "--calibration-ransac-threshold", type=float, default=0.15,
         help="Court-space RANSAC threshold in metres (default: 0.15)")
-    parser.add_argument("--image-size", type=int, default=1280)
+    parser.add_argument(
+        "--player-imgsz", "--image-size", dest="player_imgsz", type=int,
+        choices=(640, 960, 1280), default=640,
+        help="Ultralytics inference image size (default: 640)")
     parser.add_argument("--side-margin", type=float, default=3.0)
     parser.add_argument("--baseline-margin", type=float, default=5.0)
     parser.add_argument("--start-time", type=float, default=0.0)
@@ -101,6 +106,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Tactical canvas height (default: 900 endline, 450 sideline)")
     parser.add_argument("--tactical-padding", type=int, default=40)
     parser.add_argument("--trajectory-length", type=int, default=30)
+    parser.add_argument(
+        "--show-all-tracks", action="store_true",
+        help="Also draw geometrically eligible tracks rejected by max-six selection")
+    parser.add_argument(
+        "--net-hysteresis", type=float, default=0.5,
+        help="No-switch band on each side of the 9 m net line (default: 0.5 m)")
+    parser.add_argument(
+        "--side-switch-frames", type=int, default=5,
+        help="Consecutive beyond-band frames required to change sides (default: 5)")
     parser.add_argument("--show-calibration", action="store_true")
     parser.add_argument(
         "--debug", action="store_true", help="Show tracebacks for source errors")
@@ -124,8 +138,8 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--max-frames must be positive.")
     if args.side_margin < 0 or args.baseline_margin < 0:
         raise ValueError("Analysis margins cannot be negative.")
-    if not 0.0 <= args.confidence <= 1.0:
-        raise ValueError("--confidence must be between 0 and 1.")
+    if not 0.0 <= args.player_conf <= 1.0:
+        raise ValueError("--player-conf must be between 0 and 1.")
     if ((args.tactical_width is not None and args.tactical_width <= 0)
             or (args.tactical_height is not None and args.tactical_height <= 0)):
         raise ValueError("Tactical video dimensions must be positive.")
@@ -137,6 +151,10 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--youtube-max-height must be positive.")
     if args.calibration_ransac_threshold <= 0:
         raise ValueError("--calibration-ransac-threshold must be positive.")
+    if args.net_hysteresis < 0:
+        raise ValueError("--net-hysteresis cannot be negative.")
+    if args.side_switch_frames <= 0:
+        raise ValueError("--side-switch-frames must be positive.")
 
 
 def resolve_camera_view(
@@ -198,10 +216,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     try:
         detector = UltralyticsPlayerDetector(
             model_path=resolved_model.path,
-            confidence=args.confidence,
+            confidence=args.player_conf,
             device=resolved_model.device,
             person_class_id=args.person_class_id,
-            image_size=args.image_size,
+            image_size=args.player_imgsz,
         )
     except Exception as exc:
         if args.debug:
@@ -250,6 +268,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         show_track_ids=args.show_track_ids,
         preview_tactical_view=args.show_tactical_view,
         camera_view=camera_view,
+        show_all_tracks=args.show_all_tracks,
+        net_hysteresis_m=args.net_hysteresis,
+        side_switch_frames=args.side_switch_frames,
     )
     frame_count = run_pipeline(
         source_video=source_video,
