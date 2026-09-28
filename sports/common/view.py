@@ -4,6 +4,20 @@ import numpy as np
 import numpy.typing as npt
 
 
+def get_bottom_center_points(
+        xyxy: npt.NDArray[np.floating]
+) -> npt.NDArray[np.float32]:
+    """Return the ground/contact approximation for ``[x1, y1, x2, y2]`` boxes."""
+    boxes = np.asarray(xyxy, dtype=np.float32)
+    if boxes.size == 0:
+        return np.empty((0, 2), dtype=np.float32)
+    if boxes.ndim != 2 or boxes.shape[1] != 4:
+        raise ValueError("Bounding boxes must be an Nx4 array in xyxy format.")
+    return np.column_stack(
+        ((boxes[:, 0] + boxes[:, 2]) / 2.0, boxes[:, 3])
+    ).astype(np.float32)
+
+
 class ViewTransformer:
     def __init__(
             self,
@@ -23,14 +37,23 @@ class ViewTransformer:
         """
         if source.shape != target.shape:
             raise ValueError("Source and target must have the same shape.")
-        if source.shape[1] != 2:
-            raise ValueError("Source and target points must be 2D coordinates.")
+        if source.ndim != 2 or source.shape[1] != 2:
+            raise ValueError("Source and target must be arrays of 2D coordinates.")
+        if source.shape[0] < 4:
+            raise ValueError("At least four point correspondences are required.")
+        if not np.isfinite(source).all() or not np.isfinite(target).all():
+            raise ValueError("Source and target points must be finite.")
 
         source = source.astype(np.float32)
         target = target.astype(np.float32)
         self.m, _ = cv2.findHomography(source, target)
         if self.m is None:
             raise ValueError("Homography matrix could not be calculated.")
+
+        try:
+            self.inverse_m = np.linalg.inv(self.m)
+        except np.linalg.LinAlgError as exc:
+            raise ValueError("Homography matrix is not invertible.") from exc
 
     def transform_points(
             self,
@@ -51,11 +74,26 @@ class ViewTransformer:
         if points.size == 0:
             return points
 
-        if points.shape[1] != 2:
-            raise ValueError("Points must be 2D coordinates.")
+        if points.ndim != 2 or points.shape[1] != 2:
+            raise ValueError("Points must be a two-dimensional array of 2D coordinates.")
 
         reshaped_points = points.reshape(-1, 1, 2).astype(np.float32)
         transformed_points = cv2.perspectiveTransform(reshaped_points, self.m)
+        return transformed_points.reshape(-1, 2).astype(np.float32)
+
+    def inverse_transform_points(
+            self,
+            points: npt.NDArray[np.float32]
+    ) -> npt.NDArray[np.float32]:
+        """Transform target-space points back into source coordinates."""
+        if points.size == 0:
+            return points
+        if points.ndim != 2 or points.shape[1] != 2:
+            raise ValueError("Points must be a two-dimensional array of 2D coordinates.")
+
+        reshaped_points = points.reshape(-1, 1, 2).astype(np.float32)
+        transformed_points = cv2.perspectiveTransform(
+            reshaped_points, self.inverse_m)
         return transformed_points.reshape(-1, 2).astype(np.float32)
 
     def transform_image(

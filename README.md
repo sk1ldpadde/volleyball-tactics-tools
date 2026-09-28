@@ -46,6 +46,13 @@ Visit [Roboflow Universe](https://universe.roboflow.com/) and explore other spor
 
 https://github.com/roboflow/sports/assets/26109316/7ad414dd-cc4e-476d-9af3-02dfdf029205
 
+## 🏐 volleyball
+
+The local-first Volleyball MVP adds manual court calibration, person detection,
+ByteTrack tracking, metric 9 m × 18 m coordinates, tactical video rendering, and CSV
+export. See [`examples/volleyball/README.md`](examples/volleyball/README.md) for setup,
+commands, limitations, and model licensing notes.
+
 ## 🏆 contribution
 
 We love your input! [Let us know](https://github.com/roboflow/sports/issues) what else we should build!

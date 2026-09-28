@@ -34,7 +34,11 @@ setuptools.setup(
     extras_require={
         'tests': [
             'pytest',
-        ]
+        ],
+        'volleyball': [
+            'supervision<0.30',
+            'ultralytics',
+        ],
     },
     classifiers=[
         'Development Status :: 4 - Beta',
