@@ -125,6 +125,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--show-occlusion-zones", action="store_true",
         help="Draw configured camera-space obstruction polygons")
+    parser.add_argument(
+        "--reconnect-max-gap-frames", type=int,
+        help="Maximum raw-track break to repair (default: 1.5 seconds of video)")
+    parser.add_argument(
+        "--reconnect-max-distance-m", type=float, default=3.0,
+        help="Maximum metric reconnection distance (default: 3.0)")
+    parser.add_argument(
+        "--reconnect-max-speed-mps", type=float, default=8.0,
+        help="Maximum plausible average speed for reconnection (default: 8.0)")
+    parser.add_argument(
+        "--reconnect-min-score", type=float, default=0.68,
+        help="Minimum normalized reconnection score (default: 0.68)")
+    parser.add_argument(
+        "--reconnect-ambiguity-margin", type=float, default=0.12,
+        help="Reject matches whose top scores differ by less than this (default: 0.12)")
     parser.add_argument("--show-calibration", action="store_true")
     parser.add_argument(
         "--debug", action="store_true", help="Show tracebacks for source errors")
@@ -168,6 +183,14 @@ def _validate_args(args: argparse.Namespace) -> None:
     if (args.active_occlusion_grace_frames is not None
             and args.active_occlusion_grace_frames < 0):
         raise ValueError("--active-occlusion-grace-frames cannot be negative.")
+    if args.reconnect_max_gap_frames is not None and args.reconnect_max_gap_frames <= 0:
+        raise ValueError("--reconnect-max-gap-frames must be positive.")
+    if args.reconnect_max_distance_m <= 0 or args.reconnect_max_speed_mps <= 0:
+        raise ValueError("Reconnection distance and speed must be positive.")
+    if not 0.0 <= args.reconnect_min_score <= 1.0:
+        raise ValueError("--reconnect-min-score must be between 0 and 1.")
+    if not 0.0 <= args.reconnect_ambiguity_margin <= 1.0:
+        raise ValueError("--reconnect-ambiguity-margin must be between 0 and 1.")
 
 
 def resolve_camera_view(
@@ -287,6 +310,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         active_occlusion_grace_frames=args.active_occlusion_grace_frames,
         show_occluded_players=args.show_occluded_players,
         show_occlusion_zones=args.show_occlusion_zones,
+        reconnect_max_gap_frames=args.reconnect_max_gap_frames,
+        reconnect_max_distance_m=args.reconnect_max_distance_m,
+        reconnect_max_speed_mps=args.reconnect_max_speed_mps,
+        reconnect_min_score=args.reconnect_min_score,
+        reconnect_ambiguity_margin=args.reconnect_ambiguity_margin,
     )
     frame_count = run_pipeline(
         source_video=source_video,

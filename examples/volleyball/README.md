@@ -14,14 +14,15 @@ The MVP:
 - maps player bounding-box bottom centers into a 9 m × 18 m court;
 - detects only the COCO person class using an official auto-resolved Ultralytics model
   or a trusted local compatible checkpoint;
-- assigns temporary ByteTrack IDs;
+- preserves ByteTrack IDs as raw observations and builds conservative logical player IDs;
 - retains positions inside configurable side/baseline analysis margins;
 - selects at most six temporally stable active tracks on each canonical court side;
 - writes annotated, tactical, and side-by-side MP4 files plus `player_tracks.csv`.
 
 It does **not** identify teams or people, detect the ball, segment rallies, recognize
 actions, estimate 3D positions, preserve audio, compensate for a moving camera, or run
-a web service. Tracker IDs are temporary and may change after long occlusions.
+a web service. Logical reconnection uses geometry and motion only; it has no learned
+appearance/ReID signal.
 
 ## Architecture
 
@@ -39,6 +40,9 @@ Raw tracks
   |
   v
 Court homography / analysis-area filter
+  |
+  v
+Occlusion-aware raw-fragment reconnection
   |
   v
 Temporal active-player selector (max 6 FAR + max 6 NEAR)
@@ -347,6 +351,24 @@ them in the annotated video. A zone is evidence for temporary occlusion and a
 long-stationary net-side official; it is not an exclusion mask. The MVP stores and
 validates manually authored polygons but does not yet provide an interactive zone UI.
 
+### Logical player reconnection
+
+ByteTrack's `raw_track_id` is never rewritten. A separate sequential
+`logical_player_track_id` survives short raw-track breaks. Reconnection is attempted
+only when a new raw track appears while a previously active logical player is missing.
+Hard gates require the same canonical court side, a bounded frame gap, a nearby metric
+position, and plausible average speed. The normalized score combines last-position and
+damped constant-velocity prediction distances, time, motion, incumbent status, and
+dynamic/static occlusion evidence. Ambiguous top matches are rejected, and accepted
+matches are one-to-one. A false merge is considered worse than fragmentation.
+
+Defaults are a 1.5-second maximum gap (derived from source FPS), `3.0 m` distance,
+`8.0 m/s` speed, score `0.68`, and ambiguity margin `0.12`. Tune them with
+`--reconnect-max-gap-frames`, `--reconnect-max-distance-m`,
+`--reconnect-max-speed-mps`, `--reconnect-min-score`, and
+`--reconnect-ambiguity-margin`. The appearance-score seam is intentionally inactive
+until a separately validated ReID phase.
+
 ## Outputs
 
 Every output directory contains:
@@ -356,6 +378,9 @@ Every output directory contains:
   confidence, box, pixel foot point, metric court point, court/analysis-area flags,
   canonical `side`, `active_player`, `active_rank`, `active_score`, raw and logical IDs,
   and observed/occluded visibility state;
+- `reconnection_events.jsonl` — one record per accepted raw-ID repair, including
+  old/new raw IDs, stable logical ID, gap, metric distances, score, side, and occlusion
+  evidence;
 - `annotated.mp4` — camera view with calibrated lines, boxes, foot points, and IDs;
 - `tactical.mp4` — full tactical court with optional trajectory tails;
 - `combined.mp4` — synchronized annotated and tactical frames side by side.
@@ -406,8 +431,9 @@ player identity classification.
   can detect officials or spectators. Geometry removes only people whose projected foot
   point falls outside the configured area; the max-six selector cannot determine which
   six are correct when several plausible people occupy one side.
-- Automatic reconnection across a changed ByteTrack ID is deferred. The CSV includes a
-  `logical_player_track_id` seam, but it equals the raw tracker ID in this version.
+- Logical reconnection has no appearance/ReID model. Nearby same-side players with
+  similar motion may remain fragmented because ambiguous geometry is deliberately
+  rejected; every accepted merge still deserves video review.
 - Static occlusion polygons are camera-specific and must be authored manually in the
   saved calibration JSON. Camera movement invalidates both calibration and zones.
 - If `yolo26s @ 960` or `yolo26m @ 960` still misses real players, a small

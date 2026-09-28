@@ -3,6 +3,7 @@
 from collections import defaultdict, deque
 import csv
 from dataclasses import dataclass, field
+import json
 import logging
 from pathlib import Path
 from typing import Deque, Dict, List, Optional, Set, Tuple
@@ -23,6 +24,8 @@ try:
         ActivePlayerSelector,
         ActivePlayerSelectorConfig,
         PlayerSelection,
+        ReconnectionConfig,
+        SelectionResult,
         TrackCandidate,
         TrackSide,
         VisibilityState,
@@ -34,6 +37,8 @@ except ImportError:  # Support direct execution from examples/volleyball.
         ActivePlayerSelector,
         ActivePlayerSelectorConfig,
         PlayerSelection,
+        ReconnectionConfig,
+        SelectionResult,
         TrackCandidate,
         TrackSide,
         VisibilityState,
@@ -45,6 +50,7 @@ CSV_COLUMNS = (
     "frame_index",
     "timestamp_s",
     "track_id",
+    "raw_track_id",
     "logical_player_track_id",
     "confidence",
     "bbox_x1",
@@ -71,6 +77,11 @@ CSV_COLUMNS = (
     "visibility_state",
     "occlusion_age_frames",
     "occlusion_evidence",
+    "reconnected",
+    "reconnection_from_raw_track_id",
+    "reconnection_score",
+    "reconnection_gap_frames",
+    "logical_reconnection_count",
 )
 
 
@@ -92,6 +103,11 @@ class PipelineOptions:
     active_occlusion_grace_frames: Optional[int] = None
     show_occluded_players: bool = False
     show_occlusion_zones: bool = False
+    reconnect_max_gap_frames: Optional[int] = None
+    reconnect_max_distance_m: float = 3.0
+    reconnect_max_speed_mps: float = 8.0
+    reconnect_min_score: float = 0.68
+    reconnect_ambiguity_margin: float = 0.12
 
 
 @dataclass
@@ -107,7 +123,7 @@ class _PipelineDiagnostics:
     under_six_near_frames: int = 0
     removed_candidate_instances: int = 0
     unique_raw_ids: Set[int] = field(default_factory=set)
-    unique_active_ids: Set[int] = field(default_factory=set)
+    unique_logical_ids: Set[int] = field(default_factory=set)
     temporary_occlusion_events: int = 0
     restored_after_occlusion: int = 0
     active_slots_replaced_during_grace: int = 0
@@ -119,14 +135,15 @@ class _PipelineDiagnostics:
     def observe(
         self,
         raw_ids: Set[int],
-        decisions: Dict[int, PlayerSelection],
+        result: SelectionResult,
     ) -> None:
+        decisions = result.members
         far_candidates = sum(
             decision.side is TrackSide.FAR and decision.position_observed
-            for decision in decisions.values())
+            for decision in result.visible.values())
         near_candidates = sum(
             decision.side is TrackSide.NEAR and decision.position_observed
-            for decision in decisions.values())
+            for decision in result.visible.values())
         active_far = sum(
             decision.side is TrackSide.FAR and decision.active
             for decision in decisions.values())
@@ -135,7 +152,7 @@ class _PipelineDiagnostics:
             for decision in decisions.values())
         self.raw_counts.append(len(raw_ids))
         self.candidate_counts.append(sum(
-            decision.position_observed for decision in decisions.values()))
+            decision.position_observed for decision in result.visible.values()))
         self.active_counts.append(active_far + active_near)
         self.capped_far_frames += int(far_candidates > 6)
         self.capped_near_frames += int(near_candidates > 6)
@@ -149,8 +166,8 @@ class _PipelineDiagnostics:
         self.removed_candidate_instances += (
             self.candidate_counts[-1] - visible_active)
         self.unique_raw_ids.update(raw_ids)
-        self.unique_active_ids.update(
-            track_id for track_id, decision in decisions.items() if decision.active)
+        self.unique_logical_ids.update(
+            logical_id for logical_id, decision in decisions.items() if decision.active)
         current_occluded = {
             track_id for track_id, decision in decisions.items()
             if decision.active and decision.occluded
@@ -172,7 +189,7 @@ class _PipelineDiagnostics:
             self._last_occlusion_age.pop(track_id, 0) for track_id in ended)
         self._previous_occluded = current_occluded
 
-    def log(self, frames: int) -> None:
+    def log(self, frames: int, selector: ActivePlayerSelector) -> None:
         median_raw = float(np.median(self.raw_counts)) if self.raw_counts else 0.0
         median_candidates = (
             float(np.median(self.candidate_counts)) if self.candidate_counts else 0.0)
@@ -192,8 +209,8 @@ class _PipelineDiagnostics:
             "Frames with fewer than 6 active: FAR=%d, NEAR=%d",
             self.under_six_far_frames, self.under_six_near_frames)
         LOGGER.info(
-            "Unique IDs: raw=%d, active=%d",
-            len(self.unique_raw_ids), len(self.unique_active_ids))
+            "Unique IDs: raw=%d, logical active=%d",
+            len(self.unique_raw_ids), len(self.unique_logical_ids))
         LOGGER.info(
             "Candidate instances removed by selector: %d",
             self.removed_candidate_instances)
@@ -215,6 +232,40 @@ class _PipelineDiagnostics:
         LOGGER.info(
             "Tracks disappearing inside static occlusion zones: %d",
             self.disappearances_in_zones)
+        reconnect = selector.diagnostics
+        events = selector.events
+        raw_counts_by_logical = [
+            len(player.previous_raw_track_ids)
+            for player in selector.logical_players.values()
+            if player.was_ever_active
+        ]
+        fragmented = sum(count > 1 for count in raw_counts_by_logical)
+        fragmentation_ratio = (
+            sum(raw_counts_by_logical) / len(raw_counts_by_logical)
+            if raw_counts_by_logical else 0.0
+        )
+        LOGGER.info(
+            "Reconnections: accepted=%d, ambiguous=%d, side=%d, distance=%d, "
+            "speed=%d, score=%d, referee=%d",
+            reconnect.accepted, reconnect.ambiguous_rejected,
+            reconnect.rejected_side, reconnect.rejected_distance,
+            reconnect.rejected_speed, reconnect.rejected_score,
+            reconnect.rejected_referee,
+        )
+        LOGGER.info(
+            "Reconnection gap frames: mean=%.1f, maximum=%d",
+            float(np.mean([event.gap_frames for event in events])) if events else 0.0,
+            max((event.gap_frames for event in events), default=0),
+        )
+        LOGGER.info(
+            "Reconnection distance meters: mean=%.3f",
+            float(np.mean([event.distance_m for event in events])) if events else 0.0,
+        )
+        LOGGER.info(
+            "Identity fragmentation: raw IDs/logical active IDs=%.3f; "
+            "logical players with >1 raw ID=%d; max raw IDs/logical player=%d",
+            fragmentation_ratio, fragmented, max(raw_counts_by_logical, default=0),
+        )
 
 
 def _video_writer(path: Path, fps: float, size: Tuple[int, int]) -> cv2.VideoWriter:
@@ -233,7 +284,7 @@ def _annotate_source(
     config: VolleyballCourtConfiguration,
     show_detections: bool,
     show_track_ids: bool,
-    decisions: Dict[int, PlayerSelection],
+    result: SelectionResult,
     show_occluded_players: bool,
     show_occlusion_zones: bool,
 ) -> np.ndarray:
@@ -256,17 +307,29 @@ def _annotate_source(
                 (0, 255, 255), thickness=-1)
         if show_track_ids and tracker_ids is not None:
             track_id = int(tracker_ids[index])
-            decision = decisions.get(track_id)
+            decision = result.visible.get(track_id)
             state = (
                 "ACTIVE" if decision is not None and decision.active
                 else "REJECTED" if decision is not None
                 else "RAW"
             )
             cv2.putText(
-                annotated, f"ID {track_id} {state}", (x1, max(20, y1 - 8)),
+                annotated,
+                (
+                    f"L{decision.logical_player_track_id} R{track_id} {state}"
+                    if decision is not None and decision.logical_player_track_id is not None
+                    else f"R{track_id} {state}"
+                ),
+                (x1, max(20, y1 - 8)),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2, cv2.LINE_AA)
+            if decision is not None and decision.reconnected:
+                cv2.putText(
+                    annotated,
+                    f"RECONNECTED R{decision.reconnection_from_raw_track_id} -> R{track_id}",
+                    (x1, min(annotated.shape[0] - 10, y2 + 22)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2, cv2.LINE_AA)
     if show_occluded_players:
-        for track_id, decision in decisions.items():
+        for logical_id, decision in result.members.items():
             if not decision.active or decision.position_observed:
                 continue
             if decision.last_known_bbox is None:
@@ -274,7 +337,9 @@ def _annotate_source(
             x1, y1, x2, y2 = np.rint(decision.last_known_bbox).astype(int)
             cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 255), 2)
             cv2.putText(
-                annotated, f"ID {track_id} {decision.visibility.value.upper()}",
+                annotated,
+                f"L{logical_id} {decision.visibility.value.upper()} last R"
+                f"{decision.last_known_raw_track_id or '-'}",
                 (x1, max(20, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
                 (0, 255, 255), 2, cv2.LINE_AA)
     return annotated
@@ -372,12 +437,24 @@ def run_pipeline(
     selector = ActivePlayerSelector(
         court=config,
         config=ActivePlayerSelectorConfig(
+            frame_rate=fps,
             net_hysteresis_m=options.net_hysteresis_m,
             side_switch_frames=options.side_switch_frames,
             active_occlusion_grace_frames=(
                 options.active_occlusion_grace_frames
                 if options.active_occlusion_grace_frames is not None
                 else max(1, int(round(fps)))
+            ),
+            reconnection=ReconnectionConfig(
+                max_gap_frames=(
+                    options.reconnect_max_gap_frames
+                    if options.reconnect_max_gap_frames is not None
+                    else max(1, int(round(1.5 * fps)))
+                ),
+                max_distance_m=options.reconnect_max_distance_m,
+                max_speed_mps=options.reconnect_max_speed_mps,
+                min_score=options.reconnect_min_score,
+                ambiguity_margin=options.reconnect_ambiguity_margin,
             ),
         ),
     )
@@ -386,12 +463,24 @@ def run_pipeline(
         selector.config.active_occlusion_grace_frames,
         selector.config.active_occlusion_grace_frames / fps,
     )
+    LOGGER.info(
+        "Logical reconnection: max gap=%d frames (%.2f s), distance=%.2f m, "
+        "speed=%.2f m/s, minimum score=%.2f, ambiguity margin=%.2f",
+        selector.config.reconnection.max_gap_frames,
+        selector.config.reconnection.max_gap_frames / fps,
+        selector.config.reconnection.max_distance_m,
+        selector.config.reconnection.max_speed_mps,
+        selector.config.reconnection.min_score,
+        selector.config.reconnection.ambiguity_margin,
+    )
     diagnostics = _PipelineDiagnostics([], [], [])
     written_frames = 0
 
     try:
         with (output_dir / "player_tracks.csv").open(
-            "w", newline="", encoding="utf-8") as csv_file:
+            "w", newline="", encoding="utf-8") as csv_file, (
+                output_dir / "reconnection_events.jsonl"
+            ).open("w", encoding="utf-8") as event_file:
             csv_writer = csv.DictWriter(csv_file, fieldnames=CSV_COLUMNS)
             csv_writer.writeheader()
             while True:
@@ -441,30 +530,37 @@ def run_pipeline(
                                 for zone in calibration.image_occlusion_zones),
                         ))
 
-                decisions = selector.select(
+                result = selector.select(
                     candidates,
                     frame_index,
                     occluder_bboxes=tuple(
                         tuple(float(value) for value in box)
                         for box in detections.xyxy),
                 )
+                for event in result.reconnection_events:
+                    event_file.write(json.dumps(event.to_dict(), sort_keys=True) + "\n")
                 current_players: Dict[int, Point] = {}
                 inactive_players: Dict[int, Point] = {}
                 occluded_players: Dict[int, Point] = {}
                 for record in raw_records:
                     (track_id, court_point, foot_point, confidence, box,
                      inside_court, inside_analysis) = record
-                    decision = decisions.get(track_id)
+                    decision = result.visible.get(track_id)
                     if decision is not None and decision.active:
-                        current_players[track_id] = court_point
-                        trajectories[track_id].append(court_point)
+                        logical_id = int(decision.logical_player_track_id)
+                        current_players[logical_id] = court_point
+                        trajectories[logical_id].append(court_point)
                     elif decision is not None:
                         inactive_players[track_id] = court_point
                     csv_writer.writerow({
                         "frame_index": frame_index,
                         "timestamp_s": f"{timestamp_s:.6f}",
                         "track_id": track_id,
-                        "logical_player_track_id": track_id,
+                        "raw_track_id": track_id,
+                        "logical_player_track_id": (
+                            decision.logical_player_track_id
+                            if decision is not None
+                            and decision.logical_player_track_id is not None else ""),
                         "confidence": f"{confidence:.6f}",
                         "bbox_x1": f"{box[0]:.3f}",
                         "bbox_y1": f"{box[1]:.3f}",
@@ -495,19 +591,37 @@ def run_pipeline(
                         "visibility_state": VisibilityState.VISIBLE.value,
                         "occlusion_age_frames": 0,
                         "occlusion_evidence": "",
+                        "reconnected": bool(decision and decision.reconnected),
+                        "reconnection_from_raw_track_id": (
+                            decision.reconnection_from_raw_track_id
+                            if decision is not None
+                            and decision.reconnection_from_raw_track_id is not None else ""),
+                        "reconnection_score": (
+                            f"{decision.reconnection_score:.6f}"
+                            if decision is not None
+                            and decision.reconnection_score is not None else ""),
+                        "reconnection_gap_frames": (
+                            decision.reconnection_gap_frames
+                            if decision is not None
+                            and decision.reconnection_gap_frames is not None else ""),
+                        "logical_reconnection_count": (
+                            decision.logical_reconnection_count
+                            if decision is not None
+                            and decision.logical_player_track_id is not None else ""),
                     })
 
-                for track_id, decision in decisions.items():
+                for logical_id, decision in result.members.items():
                     if not decision.active or decision.position_observed:
                         continue
                     last_point = decision.last_known_court_point
                     if last_point is not None:
-                        occluded_players[track_id] = last_point
+                        occluded_players[logical_id] = last_point
                     csv_writer.writerow({
                         "frame_index": frame_index,
                         "timestamp_s": f"{timestamp_s:.6f}",
-                        "track_id": track_id,
-                        "logical_player_track_id": track_id,
+                        "track_id": "",
+                        "raw_track_id": "",
+                        "logical_player_track_id": logical_id,
                         "confidence": "",
                         "bbox_x1": "",
                         "bbox_y1": "",
@@ -535,13 +649,18 @@ def run_pipeline(
                         "visibility_state": decision.visibility.value,
                         "occlusion_age_frames": decision.occlusion_age,
                         "occlusion_evidence": decision.occlusion_evidence or "",
+                        "reconnected": False,
+                        "reconnection_from_raw_track_id": "",
+                        "reconnection_score": "",
+                        "reconnection_gap_frames": "",
+                        "logical_reconnection_count": decision.logical_reconnection_count,
                     })
 
-                diagnostics.observe(set(int(value) for value in tracker_ids), decisions)
+                diagnostics.observe(set(int(value) for value in tracker_ids), result)
 
                 annotated = _annotate_source(
                     frame, detections, calibration, config,
-                    options.show_detections, options.show_track_ids, decisions,
+                    options.show_detections, options.show_track_ids, result,
                     options.show_occluded_players, options.show_occlusion_zones)
                 tactical = draw_player_tracks_on_volleyball_court(
                     config=config,
@@ -575,5 +694,5 @@ def run_pipeline(
         if options.preview_tactical_view:
             cv2.destroyAllWindows()
 
-    diagnostics.log(written_frames)
+    diagnostics.log(written_frames, selector)
     return written_frames

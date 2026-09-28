@@ -51,6 +51,22 @@ def test_cli_accepts_occlusion_debug_controls() -> None:
     assert args.show_occlusion_zones
 
 
+def test_cli_accepts_logical_reconnection_controls() -> None:
+    args = build_parser().parse_args([
+        "--source-video", "match.mp4", "--output-dir", "out",
+        "--reconnect-max-gap-frames", "50",
+        "--reconnect-max-distance-m", "2.5",
+        "--reconnect-max-speed-mps", "7.0",
+        "--reconnect-min-score", "0.72",
+        "--reconnect-ambiguity-margin", "0.15",
+    ])
+    assert args.reconnect_max_gap_frames == 50
+    assert args.reconnect_max_distance_m == 2.5
+    assert args.reconnect_max_speed_mps == 7.0
+    assert args.reconnect_min_score == 0.72
+    assert args.reconnect_ambiguity_margin == 0.15
+
+
 def test_cli_accepts_youtube_url() -> None:
     args = build_parser().parse_args(
         ["--youtube-url", "https://youtu.be/abc123", *BASE_ARGS]
