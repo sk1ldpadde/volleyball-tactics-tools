@@ -1,6 +1,7 @@
 from examples.volleyball.selection import (
     ActivePlayerSelector,
     ActivePlayerSelectorConfig,
+    PositionSource,
     ReconnectionConfig,
     TrackCandidate,
     TrackSide,
@@ -327,3 +328,82 @@ def test_selection_and_reconnection_are_renderer_orientation_invariant() -> None
             result.reconnection_events[0].score,
         ))
     assert outputs[0] == outputs[1]
+
+
+def test_impossible_raw_position_spike_is_preserved_but_not_used() -> None:
+    selector = ActivePlayerSelector(
+        VolleyballCourtConfiguration(),
+        _config(position_max_speed_mps=8.0, position_smoothing_alpha=0.5),
+    )
+    selector.select([_candidate(7, 4.0, x=2.0)], 0)
+    selector.select([_candidate(7, 4.0, x=2.1)], 1)
+
+    result = selector.select([_candidate(7, 4.0, x=6.0)], 2)
+    decision = result.visible[7]
+
+    assert decision.raw_court_point == (6.0, 4.0)
+    assert decision.position_outlier
+    assert not decision.position_used
+    assert decision.position_source in {PositionSource.PREDICTED, PositionSource.HELD}
+    assert decision.court_point[0] < 3.0
+
+
+def test_stabilized_position_belongs_to_logical_id_after_reconnection() -> None:
+    selector = ActivePlayerSelector(
+        VolleyballCourtConfiguration(), _config(position_smoothing_alpha=0.5))
+    first = _establish(selector, [_candidate(7, 4.0, x=2.0)])
+    logical_id = first.visible[7].logical_player_track_id
+    previous = first.visible[7].court_point
+    selector.select([], 3)
+
+    result = selector.select([_candidate(15, 4.0, x=2.2)], 4)
+
+    assert result.visible[15].logical_player_track_id == logical_id
+    assert result.visible[15].court_point != (2.2, 4.0)
+    assert abs(result.visible[15].court_point[0] - previous[0]) < 0.2
+
+
+def test_player_overlap_preserves_missing_blocker_as_occluded() -> None:
+    selector = ActivePlayerSelector(
+        VolleyballCourtConfiguration(),
+        _config(player_overlap_distance_m=1.0, dynamic_overlap_threshold=0.2),
+    )
+    blockers = [
+        _candidate(7, 8.0, x=3.0, bbox=(100, 100, 160, 240)),
+        _candidate(8, 8.0, x=3.5, bbox=(140, 100, 200, 240)),
+    ]
+    first = _establish(selector, blockers)
+    hidden_logical = first.visible[7].logical_player_track_id
+
+    merged = _candidate(8, 8.0, x=3.4, bbox=(105, 95, 205, 245))
+    result = selector.select([merged], 3)
+
+    hidden = result.members[hidden_logical]
+    assert hidden.active
+    assert hidden.visibility is VisibilityState.OCCLUDED
+    assert hidden.occlusion_evidence == "player_overlap"
+    assert len(_active_logical(result, TrackSide.FAR)) == 2
+
+
+def test_player_overlap_reappearance_reconnects_without_extra_slot() -> None:
+    selector = ActivePlayerSelector(
+        VolleyballCourtConfiguration(),
+        _config(player_overlap_distance_m=1.0, dynamic_overlap_threshold=0.2),
+    )
+    blockers = [
+        _candidate(7, 8.0, x=3.0, bbox=(100, 100, 160, 240)),
+        _candidate(8, 8.0, x=3.5, bbox=(140, 100, 200, 240)),
+    ]
+    first = _establish(selector, blockers)
+    hidden_logical = first.visible[7].logical_player_track_id
+    selector.select([_candidate(
+        8, 8.0, x=3.4, bbox=(105, 95, 205, 245))], 3)
+
+    result = selector.select([
+        _candidate(8, 8.0, x=3.6, bbox=(145, 100, 205, 240)),
+        _candidate(15, 8.0, x=3.1, bbox=(95, 100, 155, 240)),
+    ], 4)
+
+    assert result.visible[15].logical_player_track_id == hidden_logical
+    assert result.reconnection_events[0].occlusion_evidence_type == "player_overlap"
+    assert len(_active_logical(result, TrackSide.FAR)) == 2

@@ -1,13 +1,18 @@
 from collections import deque
 
 import numpy as np
+import pytest
 
 from sports.annotators.volleyball import (
     court_to_canvas,
     draw_player_tracks_on_volleyball_court,
     draw_volleyball_court,
 )
-from sports.configs.volleyball import CameraView, VolleyballCourtConfiguration
+from sports.configs.volleyball import (
+    CameraEdge,
+    CameraView,
+    VolleyballCourtConfiguration,
+)
 
 
 def test_renderer_shape_and_court_points_are_on_canvas() -> None:
@@ -77,3 +82,27 @@ def test_sideline_rotation_preserves_canonical_landmark_spacing() -> None:
     assert sideline[3, 0] == 450  # net remains centered
     assert sideline[3, 0] - sideline[2, 0] == 150  # 3 metres
     assert sideline[4, 0] - sideline[3, 0] == 150  # 3 metres
+
+
+@pytest.mark.parametrize(
+    ("camera_view", "camera_edge", "near", "far", "resolution"),
+    [
+        (CameraView.SIDELINE, CameraEdge.X0, (0.0, 9.0), (9.0, 9.0), (900, 450)),
+        (CameraView.SIDELINE, CameraEdge.X9, (9.0, 9.0), (0.0, 9.0), (900, 450)),
+        (CameraView.ENDLINE, CameraEdge.Y0, (4.5, 0.0), (4.5, 18.0), (450, 900)),
+        (CameraView.ENDLINE, CameraEdge.Y18, (4.5, 18.0), (4.5, 0.0), (450, 900)),
+    ],
+)
+def test_camera_near_edge_always_renders_below_far_edge(
+    camera_view, camera_edge, near, far, resolution,
+) -> None:
+    config = VolleyballCourtConfiguration(side_margin=0, baseline_margin=0)
+    world = np.asarray([near, far, (2.0, 14.0)], dtype=np.float32)
+
+    pixels = court_to_canvas(
+        config, world, resolution_wh=resolution, padding=0,
+        include_free_zone=False, camera_view=camera_view,
+        camera_edge=camera_edge)
+
+    assert pixels[0, 1] > pixels[1, 1]
+    np.testing.assert_array_equal(world[2], (2.0, 14.0))

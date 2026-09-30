@@ -2,9 +2,13 @@ from pathlib import Path
 
 import pytest
 
-from examples.volleyball.main import build_parser, resolve_camera_view
+from examples.volleyball.main import (
+    build_parser,
+    resolve_camera_edge,
+    resolve_camera_view,
+)
 from sports.common.calibration import CourtCalibration
-from sports.configs.volleyball import CameraView
+from sports.configs.volleyball import CameraEdge, CameraView
 
 
 BASE_ARGS = ["--output-dir", "output", "--player-model", "model.pt"]
@@ -19,6 +23,7 @@ def test_cli_accepts_local_video() -> None:
     assert args.player_model == "model.pt"
     assert args.models_dir == Path("models/ultralytics")
     assert args.camera_view is None
+    assert args.camera_edge == "auto"
 
 
 def test_cli_defaults_to_auto_player_model() -> None:
@@ -94,11 +99,19 @@ def test_saved_calibration_camera_view_conflict_is_rejected() -> None:
             "near_left_corner": (0, 180),
         },
         camera_view=CameraView.ENDLINE,
+        camera_edge=CameraEdge.Y18,
     )
 
     assert resolve_camera_view(None, calibration) is CameraView.ENDLINE
     with pytest.raises(ValueError, match="created with camera_view=endline"):
         resolve_camera_view("sideline", calibration)
+
+
+def test_camera_edge_override_validates_view_family() -> None:
+    assert resolve_camera_edge(
+        "x9", CameraView.SIDELINE) is CameraEdge.X9
+    with pytest.raises(ValueError, match="requires camera_edge"):
+        resolve_camera_edge("y18", CameraView.SIDELINE)
 
 
 @pytest.mark.parametrize(

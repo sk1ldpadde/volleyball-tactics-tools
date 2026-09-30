@@ -8,7 +8,13 @@ import cv2
 import numpy as np
 
 from sports.common.calibration import CourtCalibration
-from sports.configs.volleyball import CameraView, Point, VolleyballCourtConfiguration
+from sports.configs.volleyball import (
+    CameraEdge,
+    CameraView,
+    Point,
+    VolleyballCourtConfiguration,
+    default_camera_edge,
+)
 
 
 LOGGER = logging.getLogger(__name__)
@@ -94,6 +100,7 @@ def _draw_reference(
     config: VolleyballCourtConfiguration,
     current_name: Optional[str],
     camera_view: CameraView,
+    camera_edge: CameraEdge,
 ) -> None:
     height, width = image.shape[:2]
     if camera_view is CameraView.ENDLINE:
@@ -113,9 +120,17 @@ def _draw_reference(
     def reference_point(point: Point) -> Tuple[int, int]:
         court_x, court_y = point
         if camera_view is CameraView.ENDLINE:
-            u, v = court_x / config.width, court_y / config.length
+            u = court_x / config.width
+            v = (
+                court_y / config.length
+                if camera_edge is CameraEdge.Y18
+                else 1.0 - court_y / config.length)
         else:
-            u, v = court_y / config.length, 1.0 - court_x / config.width
+            u = court_y / config.length
+            v = (
+                1.0 - court_x / config.width
+                if camera_edge is CameraEdge.X0
+                else court_x / config.width)
         return (int(round(x0 + u * panel_width)), int(round(y0 + v * panel_height)))
 
     corners = np.asarray(
@@ -131,7 +146,7 @@ def _draw_reference(
             image, reference_point(config.landmarks[current_name]), 7,
             (0, 255, 255), -1, cv2.LINE_AA)
 
-    camera_label = "CAMERA (near baseline)" if camera_view is CameraView.ENDLINE else "CAMERA SIDE"
+    camera_label = f"CAMERA SIDE ({camera_edge.value.upper()})"
     far_label = "FAR baseline" if camera_view is CameraView.ENDLINE else "FAR SIDE"
     cv2.putText(
         image, far_label, (x0, y0 - 10), cv2.FONT_HERSHEY_SIMPLEX,
@@ -148,6 +163,7 @@ def _quality_lines(calibration: CourtCalibration) -> List[str]:
         f"Court error m: mean {fit.mean_error_m:.3f} | median {fit.median_error_m:.3f} | max {fit.max_error_m:.3f}",
         f"Image error px: mean {fit.mean_error_px:.1f} | median {fit.median_error_px:.1f} | max {fit.max_error_px:.1f}",
         f"Heuristic quality: {fit.quality.upper()} (not an accuracy guarantee)",
+        f"Camera edge: {calibration.camera_edge.value.upper()}",
     ]
     if fit.rejected:
         lines.append("Rejected: " + ", ".join(fit.rejected))
@@ -164,6 +180,7 @@ def _draw_selection(
     candidate: Optional[CourtCalibration],
     error: Optional[str],
     camera_view: CameraView,
+    camera_edge: Optional[CameraEdge],
 ) -> np.ndarray:
     preview = frame.copy()
     selected = {name: point for name, point in actions if point is not None}
@@ -177,7 +194,11 @@ def _draw_selection(
 
     names = tuple(config.landmarks)
     current_name = names[current_index] if current_index < len(names) else None
-    _draw_reference(preview, config, current_name, camera_view)
+    display_edge = (
+        candidate.camera_edge if candidate is not None
+        else camera_edge or default_camera_edge(camera_view))
+    _draw_reference(
+        preview, config, current_name, camera_view, display_edge)
     if candidate is not None:
         preview = draw_projected_court(preview, candidate, config)
         lines = [
@@ -198,6 +219,8 @@ def _draw_selection(
             )
         lines = [
             f"Camera orientation: {camera_view.value.upper()}",
+            (f"Camera edge: {display_edge.value.upper()}"
+             if camera_edge is not None else "Camera edge: AUTO (resolved after fit)"),
             heading,
             f"Click assign | S skip | U undo | R restart | ENTER solve ({point_count}/4 minimum; 6+ recommended)",
         ]
@@ -217,6 +240,7 @@ def collect_manual_calibration(
     config: VolleyballCourtConfiguration,
     ransac_threshold_m: float = 0.15,
     camera_view: CameraView = CameraView.ENDLINE,
+    camera_edge: Optional[CameraEdge] = None,
 ) -> CourtCalibration:
     """Collect any visible subset of four or more named landmarks."""
     window_name = "Volleyball landmark calibration"
@@ -239,7 +263,8 @@ def collect_manual_calibration(
         cv2.setMouseCallback(window_name, on_mouse)
         while True:
             preview = _draw_selection(
-                frame, config, actions, len(actions), candidate, error, camera_view)
+                frame, config, actions, len(actions), candidate, error,
+                camera_view, camera_edge)
             cv2.imshow(window_name, preview)
             key = cv2.waitKey(20) & 0xFF
             if key in (ord("r"), ord("R")):
@@ -269,6 +294,7 @@ def collect_manual_calibration(
                         court_width_m=config.width,
                         court_length_m=config.length,
                         camera_view=camera_view,
+                        camera_edge=camera_edge,
                         ransac_threshold_m=ransac_threshold_m,
                     )
                 except ValueError as exc:

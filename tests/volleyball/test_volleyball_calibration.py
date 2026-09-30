@@ -5,7 +5,11 @@ import numpy as np
 import pytest
 
 from sports.common.calibration import CourtCalibration, ImageOcclusionZone
-from sports.configs.volleyball import CameraView, VolleyballCourtConfiguration
+from sports.configs.volleyball import (
+    CameraEdge,
+    CameraView,
+    VolleyballCourtConfiguration,
+)
 
 
 def _synthetic_landmarks():
@@ -146,6 +150,8 @@ def test_calibration_v2_json_roundtrip(tmp_path) -> None:
     assert "landmarks" in restored.to_dict()
     assert "fit" in restored.to_dict()
     assert restored.camera_view is CameraView.SIDELINE
+    assert restored.camera_edge is calibration.camera_edge
+    assert restored.to_dict()["camera_edge"] == calibration.camera_edge.value
     assert restored.to_dict()["camera_view"] == "sideline"
     assert restored.image_occlusion_zones == calibration.image_occlusion_zones
     assert restored.to_dict()["image_occlusion_zones"][0]["name"] == "referee_stand"
@@ -171,6 +177,7 @@ def test_version_one_four_corner_file_migrates(tmp_path) -> None:
 
     assert calibration.version == 2
     assert calibration.camera_view is CameraView.ENDLINE
+    assert calibration.camera_edge is CameraEdge.Y18
     assert calibration.image_occlusion_zones == ()
     assert set(calibration.landmarks) == {
         "far_left_corner", "far_right_corner", "near_right_corner",
@@ -204,3 +211,48 @@ def test_camera_view_never_changes_metric_homography() -> None:
         endline.create_transformer().transform_points(point),
         sideline.create_transformer().transform_points(point),
     )
+
+
+def test_camera_edge_is_inferred_from_lower_projected_midpoint() -> None:
+    config, landmarks, _matrix = _synthetic_landmarks()
+    calibration = CourtCalibration(
+        landmarks=landmarks, camera_view=CameraView.SIDELINE)
+    projections = calibration.camera_edge_projections
+
+    expected = max(projections, key=lambda edge: projections[edge][1])
+    assert calibration.camera_edge is expected
+    assert set(projections) == {CameraEdge.X0, CameraEdge.X9}
+
+
+def test_camera_edge_override_validates_camera_view() -> None:
+    _config, landmarks, _matrix = _synthetic_landmarks()
+    calibration = CourtCalibration(
+        landmarks=landmarks,
+        camera_view=CameraView.SIDELINE,
+        camera_edge=CameraEdge.X0,
+    )
+    assert calibration.camera_edge is CameraEdge.X0
+    with pytest.raises(ValueError, match="requires camera_edge"):
+        CourtCalibration(
+            landmarks=landmarks,
+            camera_view=CameraView.SIDELINE,
+            camera_edge=CameraEdge.Y18,
+        )
+
+
+def test_ambiguous_camera_edge_requires_explicit_override() -> None:
+    landmarks = {
+        "far_left_corner": (0.0, 0.0),
+        "far_right_corner": (90.0, 0.0),
+        "near_right_corner": (90.0, 180.0),
+        "near_left_corner": (0.0, 180.0),
+    }
+    with pytest.raises(ValueError, match="ambiguous.*--camera-edge"):
+        CourtCalibration(landmarks=landmarks, camera_view=CameraView.SIDELINE)
+
+    calibration = CourtCalibration(
+        landmarks=landmarks,
+        camera_view=CameraView.SIDELINE,
+        camera_edge=CameraEdge.X0,
+    )
+    assert calibration.camera_edge is CameraEdge.X0

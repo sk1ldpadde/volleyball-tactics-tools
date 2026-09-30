@@ -29,6 +29,15 @@ class VisibilityState(str, Enum):
     LOST = "lost"
 
 
+class PositionSource(str, Enum):
+    """Provenance of the tactical ground-plane position."""
+
+    OBSERVED = "observed"
+    SMOOTHED = "smoothed"
+    PREDICTED = "predicted"
+    HELD = "held"
+
+
 @dataclass(frozen=True)
 class ReconnectionConfig:
     """Thresholds and normalized score weights for fragment reconnection."""
@@ -86,6 +95,11 @@ class ActivePlayerSelectorConfig:
     stationary_footprint_m: float = 0.35
     stationary_referee_penalty: float = 1.25
     net_referee_band_m: float = 1.0
+    position_max_speed_mps: float = 10.0
+    position_median_window: int = 3
+    position_smoothing_alpha: float = 0.45
+    position_reset_gap_frames: int = 45
+    player_overlap_distance_m: float = 1.5
     reconnection: ReconnectionConfig = field(default_factory=ReconnectionConfig)
 
     def __post_init__(self) -> None:
@@ -106,6 +120,14 @@ class ActivePlayerSelectorConfig:
             raise ValueError("movement_window_frames must be greater than 1")
         if self.stationary_footprint_m < 0 or self.net_referee_band_m < 0:
             raise ValueError("movement and net thresholds cannot be negative")
+        if self.position_max_speed_mps <= 0 or self.position_reset_gap_frames <= 0:
+            raise ValueError("position speed and reset gap must be positive")
+        if self.position_median_window <= 0:
+            raise ValueError("position_median_window must be positive")
+        if not 0.0 < self.position_smoothing_alpha <= 1.0:
+            raise ValueError("position_smoothing_alpha must be in (0, 1]")
+        if self.player_overlap_distance_m <= 0:
+            raise ValueError("player_overlap_distance_m must be positive")
 
 
 @dataclass(frozen=True)
@@ -188,6 +210,11 @@ class PlayerSelection:
     reconnection_score: Optional[float] = None
     reconnection_gap_frames: Optional[int] = None
     logical_reconnection_count: int = 0
+    raw_court_point: Optional[Point] = None
+    court_point: Optional[Point] = None
+    position_used: bool = True
+    position_outlier: bool = False
+    position_source: PositionSource = PositionSource.OBSERVED
 
     @property
     def visible(self) -> bool:
@@ -230,6 +257,12 @@ class LogicalPlayerState:
     reconnection_count: int = 0
     was_ever_active: bool = False
     observed_positions: Deque[Tuple[int, Point]] = field(default_factory=deque)
+    raw_court_position: Optional[Point] = None
+    stabilized_court_position: Optional[Point] = None
+    last_position_frame: Optional[int] = None
+    position_outlier: bool = False
+    position_source: PositionSource = PositionSource.OBSERVED
+    recent_raw_positions: Deque[Point] = field(default_factory=deque)
 
     @property
     def all_raw_track_ids(self) -> Tuple[int, ...]:
@@ -306,7 +339,8 @@ class ActivePlayerSelector:
                 referee_suppressed.add(candidate.track_id)
             raw_scores[candidate.track_id] = self._score(candidate, memory, frame_index, penalty)
 
-        self._mark_missing_players(frame_index, visible_raw_ids, occluder_bboxes)
+        self._mark_missing_players(
+            frame_index, visible_raw_ids, candidate_by_raw, occluder_bboxes)
 
         # A previously known raw ID resuming after a brief tracker omission is not a
         # reconnection event: ByteTrack preserved its own identity.
@@ -410,6 +444,15 @@ class ActivePlayerSelector:
                 reconnection_score=(event.score if event else None),
                 reconnection_gap_frames=(event.gap_frames if event else None),
                 logical_reconnection_count=player.reconnection_count if player else 0,
+                raw_court_point=candidate.court_point,
+                court_point=(
+                    player.stabilized_court_position if player is not None
+                    else candidate.court_point),
+                position_used=not player.position_outlier if player is not None else True,
+                position_outlier=player.position_outlier if player is not None else False,
+                position_source=(
+                    player.position_source if player is not None
+                    else PositionSource.OBSERVED),
             )
 
         return SelectionResult(
@@ -538,6 +581,11 @@ class ActivePlayerSelector:
             observed_positions=deque(
                 [(frame_index, candidate.court_point)],
                 maxlen=self.config.reconnection.motion_history_size),
+            raw_court_position=candidate.court_point,
+            stabilized_court_position=candidate.court_point,
+            last_position_frame=frame_index,
+            recent_raw_positions=deque(
+                [candidate.court_point], maxlen=self.config.position_median_window),
         )
         self._logical_players[logical_id] = state
         self._raw_to_logical[candidate.track_id] = logical_id
@@ -550,6 +598,7 @@ class ActivePlayerSelector:
         frame_index: int,
         reconnected: bool,
     ) -> None:
+        self._update_ground_position(player, candidate.court_point, frame_index)
         if reconnected and candidate.track_id not in player.previous_raw_track_ids:
             player.previous_raw_track_ids.append(candidate.track_id)
         player.current_raw_track_id = candidate.track_id
@@ -557,24 +606,132 @@ class ActivePlayerSelector:
         player.visibility_state = VisibilityState.VISIBLE
         player.last_seen_frame = frame_index
         player.last_observed_frame = frame_index
-        player.last_observed_court_position = candidate.court_point
+        player.last_observed_court_position = (
+            player.stabilized_court_position or candidate.court_point)
         player.last_bbox = candidate.bbox
         player.last_confidence = candidate.confidence
         player.last_seen_in_occlusion_zone = candidate.in_occlusion_zone
-        player.observed_positions.append((frame_index, candidate.court_point))
+        player.observed_positions.append((
+            frame_index, player.stabilized_court_position or candidate.court_point))
         player.occlusion_evidence = None
+
+    def _update_ground_position(
+        self,
+        player: LogicalPlayerState,
+        raw_point: Point,
+        frame_index: int,
+    ) -> None:
+        """Reject impossible floor motion, then median/EMA-filter accepted metres."""
+        player.raw_court_position = raw_point
+        previous = player.stabilized_court_position
+        previous_frame = player.last_position_frame
+        if previous is None or previous_frame is None:
+            player.stabilized_court_position = raw_point
+            player.last_position_frame = frame_index
+            player.position_outlier = False
+            player.position_source = PositionSource.OBSERVED
+            player.recent_raw_positions.clear()
+            player.recent_raw_positions.append(raw_point)
+            return
+
+        gap = frame_index - previous_frame
+        if gap > self.config.position_reset_gap_frames:
+            player.stabilized_court_position = raw_point
+            player.last_position_frame = frame_index
+            player.position_outlier = False
+            player.position_source = PositionSource.OBSERVED
+            player.recent_raw_positions.clear()
+            player.recent_raw_positions.append(raw_point)
+            return
+
+        elapsed_s = max(gap / self.config.frame_rate, 1.0 / self.config.frame_rate)
+        implied_speed = _distance(raw_point, previous) / elapsed_s
+        if implied_speed > self.config.position_max_speed_mps:
+            predicted = self._predict_stabilized_position(player, frame_index)
+            player.stabilized_court_position = predicted
+            player.position_outlier = True
+            player.position_source = (
+                PositionSource.PREDICTED
+                if predicted != previous else PositionSource.HELD)
+            return
+
+        player.recent_raw_positions.append(raw_point)
+        median = np.median(
+            np.asarray(player.recent_raw_positions, dtype=np.float64), axis=0)
+        alpha = self.config.position_smoothing_alpha
+        stabilized = (
+            (1.0 - alpha) * np.asarray(previous, dtype=np.float64)
+            + alpha * median
+        )
+        player.stabilized_court_position = (
+            float(stabilized[0]), float(stabilized[1]))
+        player.last_position_frame = frame_index
+        player.position_outlier = False
+        player.position_source = PositionSource.SMOOTHED
+
+    def _predict_stabilized_position(
+        self, player: LogicalPlayerState, frame_index: int,
+    ) -> Point:
+        history = list(player.observed_positions)
+        previous = player.stabilized_court_position
+        if previous is None or len(history) < 2:
+            return previous or player.last_observed_court_position
+        (first_frame, first), (second_frame, second) = history[-2:]
+        elapsed = second_frame - first_frame
+        if elapsed <= 0:
+            return previous
+        velocity = (
+            (second[0] - first[0]) / elapsed,
+            (second[1] - first[1]) / elapsed,
+        )
+        prediction_frames = min(
+            frame_index - second_frame,
+            max(1, int(round(0.25 * self.config.frame_rate))),
+        )
+        damping = 0.5
+        return (
+            previous[0] + velocity[0] * prediction_frames * damping,
+            previous[1] + velocity[1] * prediction_frames * damping,
+        )
 
     def _mark_missing_players(
         self,
         frame_index: int,
         visible_raw_ids: Set[int],
+        candidates: Mapping[int, TrackCandidate],
         occluder_bboxes: Sequence[BBox],
     ) -> None:
         for player in self._logical_players.values():
             raw_id = player.current_raw_track_id
             if raw_id is None or raw_id in visible_raw_ids:
                 continue
-            if player.last_seen_in_occlusion_zone:
+            player_overlap = False
+            if player.active and player.last_bbox is not None:
+                for candidate in candidates.values():
+                    other_logical_id = self._raw_to_logical.get(candidate.track_id)
+                    other = self._logical_players.get(other_logical_id)
+                    if (
+                        other is None
+                        or other.logical_player_track_id == player.logical_player_track_id
+                        or not other.active
+                        or other.side is not player.side
+                        or candidate.bbox is None
+                    ):
+                        continue
+                    if (
+                        _distance(
+                            player.stabilized_court_position
+                            or player.last_observed_court_position,
+                            candidate.court_point,
+                        ) <= self.config.player_overlap_distance_m
+                        and _bbox_overlap_fraction(player.last_bbox, candidate.bbox)
+                        >= self.config.dynamic_overlap_threshold
+                    ):
+                        player_overlap = True
+                        break
+            if player_overlap:
+                player.occlusion_evidence = "player_overlap"
+            elif player.last_seen_in_occlusion_zone:
                 player.occlusion_evidence = "static_zone"
             elif player.last_bbox is not None and any(
                 _bbox_overlap_fraction(player.last_bbox, box)
@@ -630,6 +787,12 @@ class ActivePlayerSelector:
             reconnection_score=(event.score if event else None),
             reconnection_gap_frames=(event.gap_frames if event else None),
             logical_reconnection_count=player.reconnection_count,
+            raw_court_point=(candidate.court_point if candidate is not None else None),
+            court_point=player.stabilized_court_position,
+            position_used=(candidate is not None and not player.position_outlier),
+            position_outlier=(candidate is not None and player.position_outlier),
+            position_source=(
+                player.position_source if candidate is not None else PositionSource.HELD),
         )
         members[logical_id] = decision
         if observed and raw_id is not None:

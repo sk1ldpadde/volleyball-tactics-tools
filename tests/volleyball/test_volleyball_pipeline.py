@@ -9,7 +9,7 @@ import pytest
 
 from examples.volleyball.pipeline import PipelineOptions, run_pipeline
 from sports.common.calibration import CourtCalibration
-from sports.configs.volleyball import CameraView
+from sports.configs.volleyball import CameraEdge, CameraView
 
 
 class _FixedDetector:
@@ -68,6 +68,9 @@ def test_synthetic_video_runs_through_complete_pipeline(
             "near_left_corner": (40.0, 210.0),
         },
         camera_view=camera_view,
+        camera_edge=(
+            CameraEdge.X0 if camera_view is CameraView.SIDELINE
+            else CameraEdge.Y18),
     )
 
     written = run_pipeline(
@@ -96,6 +99,9 @@ def test_synthetic_video_runs_through_complete_pipeline(
     assert rows
     assert all(np.isfinite(float(row["court_x_m"])) for row in rows)
     assert all(np.isfinite(float(row["court_y_m"])) for row in rows)
+    assert all(np.isfinite(float(row["raw_court_x_m"])) for row in rows)
+    assert all(np.isfinite(float(row["raw_court_y_m"])) for row in rows)
+    assert all(row["position_source"] in {"observed", "smoothed"} for row in rows)
     assert {int(row["frame_index"]) for row in rows}.issubset(set(range(5)))
     assert all(row["side"] in {"far", "near", "unknown"} for row in rows)
     assert all(row["active_player"] in {"True", "False"} for row in rows)
@@ -161,3 +167,55 @@ def test_pipeline_records_raw_id_reconnection_without_changing_logical_id(
     assert len(events) == 1
     assert events[0]["old_raw_track_id"] == 17
     assert events[0]["new_raw_track_id"] == 42
+
+
+def test_pipeline_keeps_raw_spike_but_renders_stabilized_position(
+    tmp_path, monkeypatch,
+) -> None:
+    class _JumpingTracker:
+        def __init__(self, **_kwargs):
+            self.calls = 0
+
+        def update_with_detections(self, detections):
+            x_center = 250.0 if self.calls == 3 else 160.0
+            self.calls += 1
+            return sv.Detections(
+                xyxy=np.asarray(
+                    [[x_center - 30.0, 70.0, x_center + 30.0, 160.0]],
+                    dtype=np.float32),
+                confidence=detections.confidence,
+                class_id=detections.class_id,
+                tracker_id=np.asarray([7], dtype=int),
+            )
+
+    monkeypatch.setattr("examples.volleyball.pipeline.sv.ByteTrack", _JumpingTracker)
+    source = tmp_path / "source.mp4"
+    output = tmp_path / "output"
+    _write_video(source, frame_count=6, fps=12.0)
+    calibration = CourtCalibration(landmarks={
+        "far_left_corner": (40.0, 30.0),
+        "far_right_corner": (280.0, 30.0),
+        "near_right_corner": (280.0, 210.0),
+        "near_left_corner": (40.0, 210.0),
+    })
+
+    run_pipeline(
+        source_video=source,
+        output_dir=output,
+        detector=_FixedDetector(),
+        calibration=calibration,
+        config=calibration.configuration(),
+        options=PipelineOptions(
+            max_frames=5,
+            tactical_resolution=(240, 360),
+            position_max_speed_mps=10.0,
+        ),
+    )
+
+    with (output / "player_tracks.csv").open(newline="", encoding="utf-8") as stream:
+        rows = list(csv.DictReader(stream))
+    spike = next(row for row in rows if row["frame_index"] == "3")
+    assert spike["position_outlier"] == "True"
+    assert spike["position_used"] == "False"
+    assert spike["position_source"] in {"predicted", "held"}
+    assert abs(float(spike["raw_court_x_m"]) - float(spike["court_x_m"])) > 2.0

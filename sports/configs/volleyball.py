@@ -15,6 +15,40 @@ class CameraView(str, Enum):
     SIDELINE = "sideline"
 
 
+class CameraEdge(str, Enum):
+    """Canonical court edge closest to the camera."""
+
+    X0 = "x0"
+    X9 = "x9"
+    Y0 = "y0"
+    Y18 = "y18"
+
+
+def default_camera_edge(camera_view: CameraView) -> CameraEdge:
+    """Return the legacy display orientation for callers without calibration."""
+    camera_view = CameraView(camera_view)
+    return CameraEdge.X0 if camera_view is CameraView.SIDELINE else CameraEdge.Y18
+
+
+def validate_camera_edge(
+    camera_view: CameraView,
+    camera_edge: CameraEdge,
+) -> CameraEdge:
+    """Validate that an edge belongs to the selected camera-view family."""
+    camera_view = CameraView(camera_view)
+    camera_edge = CameraEdge(camera_edge)
+    allowed = (
+        (CameraEdge.X0, CameraEdge.X9)
+        if camera_view is CameraView.SIDELINE
+        else (CameraEdge.Y0, CameraEdge.Y18)
+    )
+    if camera_edge not in allowed:
+        values = ", ".join(edge.value for edge in allowed)
+        raise ValueError(
+            f"camera_view={camera_view.value} requires camera_edge in: {values}")
+    return camera_edge
+
+
 def default_tactical_resolution(camera_view: CameraView) -> Tuple[int, int]:
     """Return a court-shaped canvas for the requested display orientation."""
     camera_view = CameraView(camera_view)

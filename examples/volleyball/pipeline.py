@@ -15,7 +15,12 @@ import supervision as sv
 from sports.annotators.volleyball import draw_player_tracks_on_volleyball_court
 from sports.common.calibration import CourtCalibration, ImageOcclusionZone
 from sports.common.view import get_bottom_center_points
-from sports.configs.volleyball import CameraView, Point, VolleyballCourtConfiguration
+from sports.configs.volleyball import (
+    CameraEdge,
+    CameraView,
+    Point,
+    VolleyballCourtConfiguration,
+)
 
 try:
     from .calibration import draw_projected_court
@@ -24,6 +29,7 @@ try:
         ActivePlayerSelector,
         ActivePlayerSelectorConfig,
         PlayerSelection,
+        PositionSource,
         ReconnectionConfig,
         SelectionResult,
         TrackCandidate,
@@ -37,6 +43,7 @@ except ImportError:  # Support direct execution from examples/volleyball.
         ActivePlayerSelector,
         ActivePlayerSelectorConfig,
         PlayerSelection,
+        PositionSource,
         ReconnectionConfig,
         SelectionResult,
         TrackCandidate,
@@ -59,6 +66,8 @@ CSV_COLUMNS = (
     "bbox_y2",
     "foot_x_px",
     "foot_y_px",
+    "raw_court_x_m",
+    "raw_court_y_m",
     "court_x_m",
     "court_y_m",
     "court_x_m_predicted",
@@ -74,6 +83,9 @@ CSV_COLUMNS = (
     "visible",
     "occluded",
     "position_observed",
+    "position_used",
+    "position_outlier",
+    "position_source",
     "visibility_state",
     "occlusion_age_frames",
     "occlusion_evidence",
@@ -97,12 +109,16 @@ class PipelineOptions:
     show_track_ids: bool = True
     preview_tactical_view: bool = False
     camera_view: CameraView = CameraView.ENDLINE
+    camera_edge: Optional[CameraEdge] = None
     show_all_tracks: bool = False
     net_hysteresis_m: float = 0.5
     side_switch_frames: int = 5
     active_occlusion_grace_frames: Optional[int] = None
     show_occluded_players: bool = False
     show_occlusion_zones: bool = False
+    show_raw_court_points: bool = False
+    show_orientation_labels: bool = False
+    position_max_speed_mps: float = 10.0
     reconnect_max_gap_frames: Optional[int] = None
     reconnect_max_distance_m: float = 3.0
     reconnect_max_speed_mps: float = 8.0
@@ -131,6 +147,14 @@ class _PipelineDiagnostics:
     completed_occlusion_durations: List[int] = field(default_factory=list)
     _previous_occluded: Set[int] = field(default_factory=set)
     _last_occlusion_age: Dict[int, int] = field(default_factory=dict)
+    position_outliers: int = 0
+    raw_stabilized_displacements: List[float] = field(default_factory=list)
+    player_overlap_occlusion_events: int = 0
+    restored_after_player_overlap: int = 0
+    _previous_player_overlap: Set[int] = field(default_factory=set)
+    _previous_positions: Dict[int, Tuple[Point, Point]] = field(default_factory=dict)
+    raw_frame_displacements: List[float] = field(default_factory=list)
+    stabilized_frame_displacements: List[float] = field(default_factory=list)
 
     def observe(
         self,
@@ -182,6 +206,35 @@ class _PipelineDiagnostics:
             if track_id in decisions and decisions[track_id].visible
         }
         self.restored_after_occlusion += len(restored)
+        current_player_overlap = {
+            track_id for track_id in current_occluded
+            if decisions[track_id].occlusion_evidence == "player_overlap"
+        }
+        self.player_overlap_occlusion_events += len(
+            current_player_overlap - self._previous_player_overlap)
+        self.restored_after_player_overlap += len(
+            self._previous_player_overlap & restored)
+        self._previous_player_overlap = current_player_overlap
+        for decision in result.visible.values():
+            logical_id = decision.logical_player_track_id
+            if (
+                logical_id is None
+                or not decision.position_observed
+                or decision.raw_court_point is None
+            ):
+                continue
+            stable = decision.court_point or decision.raw_court_point
+            self.position_outliers += int(decision.position_outlier)
+            self.raw_stabilized_displacements.append(
+                float(np.linalg.norm(
+                    np.asarray(decision.raw_court_point) - np.asarray(stable))))
+            previous = self._previous_positions.get(logical_id)
+            if previous is not None:
+                self.raw_frame_displacements.append(float(np.linalg.norm(
+                    np.asarray(decision.raw_court_point) - np.asarray(previous[0]))))
+                self.stabilized_frame_displacements.append(float(np.linalg.norm(
+                    np.asarray(stable) - np.asarray(previous[1]))))
+            self._previous_positions[logical_id] = (decision.raw_court_point, stable)
         for track_id in current_occluded:
             self._last_occlusion_age[track_id] = decisions[track_id].occlusion_age
         ended = self._previous_occluded - current_occluded
@@ -232,6 +285,31 @@ class _PipelineDiagnostics:
         LOGGER.info(
             "Tracks disappearing inside static occlusion zones: %d",
             self.disappearances_in_zones)
+        displacement = self.raw_stabilized_displacements
+        LOGGER.info("Raw court position outliers/spikes rejected: %d", self.position_outliers)
+        LOGGER.info(
+            "Raw-to-stabilized displacement m: mean=%.3f, p95=%.3f",
+            float(np.mean(displacement)) if displacement else 0.0,
+            float(np.percentile(displacement, 95)) if displacement else 0.0,
+        )
+        LOGGER.info(
+            "Frame displacement m raw/stabilized: median=%.3f/%.3f, p95=%.3f/%.3f",
+            float(np.median(self.raw_frame_displacements))
+            if self.raw_frame_displacements else 0.0,
+            float(np.median(self.stabilized_frame_displacements))
+            if self.stabilized_frame_displacements else 0.0,
+            float(np.percentile(self.raw_frame_displacements, 95))
+            if self.raw_frame_displacements else 0.0,
+            float(np.percentile(self.stabilized_frame_displacements, 95))
+            if self.stabilized_frame_displacements else 0.0,
+        )
+        LOGGER.info(
+            "Player-overlap occlusions: events=%d, restored=%d, reconnects=%d",
+            self.player_overlap_occlusion_events,
+            self.restored_after_player_overlap,
+            sum(event.occlusion_evidence_type == "player_overlap"
+                for event in selector.events),
+        )
         reconnect = selector.diagnostics
         events = selector.events
         raw_counts_by_logical = [
@@ -287,6 +365,7 @@ def _annotate_source(
     result: SelectionResult,
     show_occluded_players: bool,
     show_occlusion_zones: bool,
+    show_raw_court_points: bool,
 ) -> np.ndarray:
     annotated = draw_projected_court(frame, calibration, config)
     if show_occlusion_zones:
@@ -328,6 +407,17 @@ def _annotate_source(
                     f"RECONNECTED R{decision.reconnection_from_raw_track_id} -> R{track_id}",
                     (x1, min(annotated.shape[0] - 10, y2 + 22)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2, cv2.LINE_AA)
+            if (
+                show_raw_court_points
+                and decision is not None
+                and decision.court_point is not None
+            ):
+                stable_pixel = calibration.create_transformer().inverse_transform_points(
+                    np.asarray([decision.court_point], dtype=np.float32))[0]
+                if np.isfinite(stable_pixel).all():
+                    cv2.circle(
+                        annotated, tuple(np.rint(stable_pixel).astype(int)), 6,
+                        (255, 0, 255), thickness=2, lineType=cv2.LINE_AA)
     if show_occluded_players:
         for logical_id, decision in result.members.items():
             if not decision.active or decision.position_observed:
@@ -339,7 +429,8 @@ def _annotate_source(
             cv2.putText(
                 annotated,
                 f"L{logical_id} {decision.visibility.value.upper()} last R"
-                f"{decision.last_known_raw_track_id or '-'}",
+                f"{decision.last_known_raw_track_id or '-'} "
+                f"[{decision.occlusion_evidence or 'unknown'}]",
                 (x1, max(20, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
                 (0, 255, 255), 2, cv2.LINE_AA)
     return annotated
@@ -399,6 +490,11 @@ def run_pipeline(
             "Pipeline camera view does not match the saved calibration: "
             f"{CameraView(options.camera_view).value} != {calibration.camera_view.value}."
         )
+    camera_edge = options.camera_edge or calibration.camera_edge
+    if CameraEdge(camera_edge) is not calibration.camera_edge:
+        raise ValueError(
+            "Pipeline camera edge does not match the resolved calibration: "
+            f"{CameraEdge(camera_edge).value} != {calibration.camera_edge.value}.")
     output_dir.mkdir(parents=True, exist_ok=True)
     capture = cv2.VideoCapture(str(source_video))
     if not capture.isOpened():
@@ -445,6 +541,7 @@ def run_pipeline(
                 if options.active_occlusion_grace_frames is not None
                 else max(1, int(round(fps)))
             ),
+            position_max_speed_mps=options.position_max_speed_mps,
             reconnection=ReconnectionConfig(
                 max_gap_frames=(
                     options.reconnect_max_gap_frames
@@ -472,6 +569,21 @@ def run_pipeline(
         selector.config.reconnection.max_speed_mps,
         selector.config.reconnection.min_score,
         selector.config.reconnection.ambiguity_margin,
+    )
+    projections = calibration.camera_edge_projections
+    LOGGER.info(
+        "Camera edge resolved: %s (%s); candidates: %s",
+        calibration.camera_edge.value, calibration.camera_view.value,
+        ", ".join(
+            f"{edge.value}=({point[0]:.1f}, {point[1]:.1f})"
+            for edge, point in projections.items()),
+    )
+    LOGGER.info(
+        "Ground-position filter: rolling median=%d, EMA alpha=%.2f, "
+        "spike threshold=%.2f m/s",
+        selector.config.position_median_window,
+        selector.config.position_smoothing_alpha,
+        selector.config.position_max_speed_mps,
     )
     diagnostics = _PipelineDiagnostics([], [], [])
     written_frames = 0
@@ -540,6 +652,7 @@ def run_pipeline(
                 for event in result.reconnection_events:
                     event_file.write(json.dumps(event.to_dict(), sort_keys=True) + "\n")
                 current_players: Dict[int, Point] = {}
+                raw_player_points: Dict[int, Point] = {}
                 inactive_players: Dict[int, Point] = {}
                 occluded_players: Dict[int, Point] = {}
                 for record in raw_records:
@@ -548,10 +661,23 @@ def run_pipeline(
                     decision = result.visible.get(track_id)
                     if decision is not None and decision.active:
                         logical_id = int(decision.logical_player_track_id)
-                        current_players[logical_id] = court_point
-                        trajectories[logical_id].append(court_point)
+                        stable_point = decision.court_point or court_point
+                        current_players[logical_id] = stable_point
+                        raw_player_points[logical_id] = court_point
+                        trajectories[logical_id].append(stable_point)
                     elif decision is not None:
                         inactive_players[track_id] = court_point
+                    stabilized_point = (
+                        decision.court_point
+                        if decision is not None and decision.court_point is not None
+                        else court_point)
+                    position_used = (
+                        decision.position_used if decision is not None else True)
+                    position_outlier = (
+                        decision.position_outlier if decision is not None else False)
+                    position_source = (
+                        decision.position_source.value
+                        if decision is not None else PositionSource.OBSERVED.value)
                     csv_writer.writerow({
                         "frame_index": frame_index,
                         "timestamp_s": f"{timestamp_s:.6f}",
@@ -568,8 +694,10 @@ def run_pipeline(
                         "bbox_y2": f"{box[3]:.3f}",
                         "foot_x_px": f"{foot_point[0]:.3f}",
                         "foot_y_px": f"{foot_point[1]:.3f}",
-                        "court_x_m": f"{court_point[0]:.6f}",
-                        "court_y_m": f"{court_point[1]:.6f}",
+                        "raw_court_x_m": f"{court_point[0]:.6f}",
+                        "raw_court_y_m": f"{court_point[1]:.6f}",
+                        "court_x_m": f"{stabilized_point[0]:.6f}",
+                        "court_y_m": f"{stabilized_point[1]:.6f}",
                         "court_x_m_predicted": "",
                         "court_y_m_predicted": "",
                         "last_known_court_x_m": f"{court_point[0]:.6f}",
@@ -588,6 +716,9 @@ def run_pipeline(
                         "visible": True,
                         "occluded": False,
                         "position_observed": True,
+                        "position_used": position_used,
+                        "position_outlier": position_outlier,
+                        "position_source": position_source,
                         "visibility_state": VisibilityState.VISIBLE.value,
                         "occlusion_age_frames": 0,
                         "occlusion_evidence": "",
@@ -629,6 +760,8 @@ def run_pipeline(
                         "bbox_y2": "",
                         "foot_x_px": "",
                         "foot_y_px": "",
+                        "raw_court_x_m": "",
+                        "raw_court_y_m": "",
                         "court_x_m": "",
                         "court_y_m": "",
                         "court_x_m_predicted": "",
@@ -646,6 +779,9 @@ def run_pipeline(
                         "visible": False,
                         "occluded": decision.occluded,
                         "position_observed": False,
+                        "position_used": False,
+                        "position_outlier": False,
+                        "position_source": PositionSource.HELD.value,
                         "visibility_state": decision.visibility.value,
                         "occlusion_age_frames": decision.occlusion_age,
                         "occlusion_evidence": decision.occlusion_evidence or "",
@@ -661,7 +797,8 @@ def run_pipeline(
                 annotated = _annotate_source(
                     frame, detections, calibration, config,
                     options.show_detections, options.show_track_ids, result,
-                    options.show_occluded_players, options.show_occlusion_zones)
+                    options.show_occluded_players, options.show_occlusion_zones,
+                    options.show_raw_court_points)
                 tactical = draw_player_tracks_on_volleyball_court(
                     config=config,
                     player_points=current_players,
@@ -671,10 +808,14 @@ def run_pipeline(
                     padding=options.tactical_padding,
                     include_free_zone=True,
                     camera_view=options.camera_view,
+                    camera_edge=camera_edge,
                     inactive_player_points=(
                         inactive_players if options.show_all_tracks else None),
                     occluded_player_points=(
                         occluded_players if options.show_occluded_players else None),
+                    raw_player_points=(
+                        raw_player_points if options.show_raw_court_points else None),
+                    debug_orientation_labels=options.show_orientation_labels,
                 )
                 combined = _combine_frames(annotated, tactical)
                 writers[0].write(annotated)

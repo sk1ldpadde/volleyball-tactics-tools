@@ -7,9 +7,11 @@ from typing import Optional, Sequence
 
 from sports.common.calibration import CourtCalibration
 from sports.configs.volleyball import (
+    CameraEdge,
     CameraView,
     VolleyballCourtConfiguration,
     default_tactical_resolution,
+    validate_camera_edge,
 )
 
 try:
@@ -71,6 +73,13 @@ def build_parser() -> argparse.ArgumentParser:
               "endline; saved calibrations retain their stored value."),
     )
     parser.add_argument(
+        "--camera-edge",
+        choices=("auto", *(edge.value for edge in CameraEdge)),
+        default="auto",
+        help=("Canonical edge closest to the camera: auto, x0, x9, y0, or y18 "
+              "(default: infer from calibration)"),
+    )
+    parser.add_argument(
         "--player-model", default="auto",
         help="auto, official yolo26n/s.pt, or a trusted local checkpoint path")
     parser.add_argument(
@@ -125,6 +134,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--show-occlusion-zones", action="store_true",
         help="Draw configured camera-space obstruction polygons")
+    parser.add_argument(
+        "--show-raw-court-points", action="store_true",
+        help="Debug raw metric anchors beside stabilized tactical positions")
+    parser.add_argument(
+        "--show-orientation-labels", action="store_true",
+        help="Label camera/far sides and canonical edges on the tactical court")
+    parser.add_argument(
+        "--position-max-speed-mps", type=float, default=10.0,
+        help="Reject ground-position observations faster than this (default: 10.0)")
     parser.add_argument(
         "--reconnect-max-gap-frames", type=int,
         help="Maximum raw-track break to repair (default: 1.5 seconds of video)")
@@ -191,6 +209,8 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--reconnect-min-score must be between 0 and 1.")
     if not 0.0 <= args.reconnect_ambiguity_margin <= 1.0:
         raise ValueError("--reconnect-ambiguity-margin must be between 0 and 1.")
+    if args.position_max_speed_mps <= 0:
+        raise ValueError("--position-max-speed-mps must be positive.")
 
 
 def resolve_camera_view(
@@ -208,6 +228,17 @@ def resolve_camera_view(
             f"{requested_view.value}. Use the matching orientation or recalibrate."
         )
     return calibration.camera_view
+
+
+def resolve_camera_edge(
+    requested: str,
+    camera_view: CameraView,
+    calibration: Optional[CourtCalibration] = None,
+) -> Optional[CameraEdge]:
+    """Resolve an explicit edge override; ``None`` requests homography inference."""
+    if requested == "auto":
+        return calibration.camera_edge if calibration is not None else None
+    return validate_camera_edge(camera_view, CameraEdge(requested))
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -267,17 +298,32 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         try:
             calibration = CourtCalibration.load(args.calibration_file)
             camera_view = resolve_camera_view(args.camera_view, calibration)
+            camera_edge = resolve_camera_edge(
+                args.camera_edge, camera_view, calibration)
+            if camera_edge is not calibration.camera_edge:
+                calibration = CourtCalibration(
+                    landmarks=calibration.landmarks,
+                    source_video=calibration.source_video,
+                    court_width_m=calibration.court_width_m,
+                    court_length_m=calibration.court_length_m,
+                    camera_view=camera_view,
+                    camera_edge=camera_edge,
+                    image_occlusion_zones=calibration.image_occlusion_zones,
+                    ransac_threshold_m=calibration.ransac_threshold_m,
+                )
         except ValueError as exc:
             parser.error(str(exc))
         LOGGER.info("Loaded calibration from %s", args.calibration_file)
     else:
         camera_view = resolve_camera_view(args.camera_view)
+        camera_edge = resolve_camera_edge(args.camera_edge, camera_view)
         calibration = collect_manual_calibration(
             calibration_frame,
             source_video,
             config,
             ransac_threshold_m=args.calibration_ransac_threshold,
             camera_view=camera_view,
+            camera_edge=camera_edge,
         )
         if args.calibration_file is not None:
             calibration.save(args.calibration_file)
@@ -304,12 +350,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         show_track_ids=args.show_track_ids,
         preview_tactical_view=args.show_tactical_view,
         camera_view=camera_view,
+        camera_edge=calibration.camera_edge,
         show_all_tracks=args.show_all_tracks,
         net_hysteresis_m=args.net_hysteresis,
         side_switch_frames=args.side_switch_frames,
         active_occlusion_grace_frames=args.active_occlusion_grace_frames,
         show_occluded_players=args.show_occluded_players,
         show_occlusion_zones=args.show_occlusion_zones,
+        show_raw_court_points=args.show_raw_court_points,
+        show_orientation_labels=args.show_orientation_labels,
+        position_max_speed_mps=args.position_max_speed_mps,
         reconnect_max_gap_frames=args.reconnect_max_gap_frames,
         reconnect_max_distance_m=args.reconnect_max_distance_m,
         reconnect_max_speed_mps=args.reconnect_max_speed_mps,

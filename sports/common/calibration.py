@@ -9,7 +9,12 @@ import cv2
 import numpy as np
 
 from sports.common.view import ViewTransformer
-from sports.configs.volleyball import CameraView, VolleyballCourtConfiguration
+from sports.configs.volleyball import (
+    CameraEdge,
+    CameraView,
+    VolleyballCourtConfiguration,
+    validate_camera_edge,
+)
 
 
 LEGACY_POINT_NAMES = ("far_left", "far_right", "near_right", "near_left")
@@ -21,6 +26,50 @@ LEGACY_TO_LANDMARK = {
     "near_left": "near_left_corner",
 }
 DEFAULT_RANSAC_THRESHOLD_M = 0.15
+DEFAULT_CAMERA_EDGE_MIN_SEPARATION_PX = 5.0
+
+
+def camera_edge_midpoints(
+    camera_view: CameraView,
+    config: VolleyballCourtConfiguration,
+) -> Mapping[CameraEdge, Tuple[float, float]]:
+    """Return canonical midpoints of the two camera-edge candidates."""
+    camera_view = CameraView(camera_view)
+    if camera_view is CameraView.SIDELINE:
+        return {
+            CameraEdge.X0: (0.0, config.center_line_y),
+            CameraEdge.X9: (config.width, config.center_line_y),
+        }
+    return {
+        CameraEdge.Y0: (config.width / 2.0, 0.0),
+        CameraEdge.Y18: (config.width / 2.0, config.length),
+    }
+
+
+def infer_camera_edge(
+    camera_view: CameraView,
+    transformer: ViewTransformer,
+    config: VolleyballCourtConfiguration,
+    minimum_separation_px: float = DEFAULT_CAMERA_EDGE_MIN_SEPARATION_PX,
+) -> Tuple[CameraEdge, Mapping[CameraEdge, Tuple[float, float]]]:
+    """Infer the camera-near canonical edge from projected image vertical position."""
+    candidates = camera_edge_midpoints(camera_view, config)
+    projected = transformer.inverse_transform_points(
+        np.asarray(list(candidates.values()), dtype=np.float32))
+    if projected.shape != (2, 2) or not np.isfinite(projected).all():
+        raise ValueError("Could not infer camera edge from finite image projections.")
+    projections = {
+        edge: (float(point[0]), float(point[1]))
+        for edge, point in zip(candidates, projected)
+    }
+    ordered = list(projections)
+    separation = abs(projections[ordered[0]][1] - projections[ordered[1]][1])
+    if separation < minimum_separation_px:
+        raise ValueError(
+            "Camera edge is ambiguous: projected candidate edges differ by only "
+            f"{separation:.1f} px vertically. Supply --camera-edge explicitly.")
+    edge = max(projections, key=lambda item: projections[item][1])
+    return edge, projections
 
 
 @dataclass(frozen=True)
@@ -103,6 +152,7 @@ class CourtCalibration:
     court_width_m: float
     court_length_m: float
     camera_view: CameraView
+    camera_edge: CameraEdge
     image_occlusion_zones: Tuple[ImageOcclusionZone, ...]
     ransac_threshold_m: float
     version: int
@@ -118,6 +168,7 @@ class CourtCalibration:
         court_width_m: float = 9.0,
         court_length_m: float = 18.0,
         camera_view: Union[CameraView, str] = CameraView.ENDLINE,
+        camera_edge: Optional[Union[CameraEdge, str]] = None,
         image_occlusion_zones: Optional[Tuple[ImageOcclusionZone, ...]] = None,
         ransac_threshold_m: float = DEFAULT_RANSAC_THRESHOLD_M,
         version: int = 2,
@@ -169,6 +220,15 @@ class CourtCalibration:
         if mask is None:
             mask = np.ones(len(names), dtype=bool)
         fit = self._calculate_fit(names, source, target, transformer, mask, config)
+        if camera_edge is None or str(camera_edge) == "auto":
+            normalized_camera_edge, _ = infer_camera_edge(
+                normalized_camera_view, transformer, config)
+        else:
+            try:
+                normalized_camera_edge = validate_camera_edge(
+                    normalized_camera_view, CameraEdge(camera_edge))
+            except ValueError as exc:
+                raise ValueError(f"Unsupported camera edge: {camera_edge!r}. {exc}") from exc
 
         object.__setattr__(self, "landmarks", {
             name: (float(normalized[name][0]), float(normalized[name][1]))
@@ -178,6 +238,7 @@ class CourtCalibration:
         object.__setattr__(self, "court_width_m", float(court_width_m))
         object.__setattr__(self, "court_length_m", float(court_length_m))
         object.__setattr__(self, "camera_view", normalized_camera_view)
+        object.__setattr__(self, "camera_edge", normalized_camera_edge)
         object.__setattr__(self, "image_occlusion_zones", zones)
         object.__setattr__(self, "ransac_threshold_m", float(ransac_threshold_m))
         object.__setattr__(self, "version", 2)
@@ -259,6 +320,14 @@ class CourtCalibration:
     def create_transformer(self) -> ViewTransformer:
         return self._transformer
 
+    @property
+    def camera_edge_projections(self) -> Mapping[CameraEdge, Tuple[float, float]]:
+        """Image positions used to infer/inspect the camera-near edge."""
+        _edge, projections = infer_camera_edge(
+            self.camera_view, self._transformer, self.configuration(),
+            minimum_separation_px=0.0)
+        return projections
+
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, CourtCalibration):
             return NotImplemented
@@ -282,6 +351,7 @@ class CourtCalibration:
             "court_width_m": self.court_width_m,
             "court_length_m": self.court_length_m,
             "camera_view": self.camera_view.value,
+            "camera_edge": self.camera_edge.value,
             "image_occlusion_zones": [
                 zone.to_dict() for zone in self.image_occlusion_zones
             ],
@@ -332,6 +402,7 @@ class CourtCalibration:
             court_width_m=float(data.get("court_width_m", 9.0)),
             court_length_m=float(data.get("court_length_m", 18.0)),
             camera_view=str(data.get("camera_view", CameraView.ENDLINE.value)),
+            camera_edge=data.get("camera_edge"),
             image_occlusion_zones=tuple(zones),
             ransac_threshold_m=float(
                 data.get("ransac_threshold_m", DEFAULT_RANSAC_THRESHOLD_M)),

@@ -42,7 +42,13 @@ Raw tracks
 Court homography / analysis-area filter
   |
   v
+Raw metric ground observation
+  |
+  v
 Occlusion-aware raw-fragment reconnection
+  |
+  v
+Logical-player metric position stabilizer
   |
   v
 Temporal active-player selector (max 6 FAR + max 6 NEAR)
@@ -70,9 +76,11 @@ dimensions live in `sports.configs.volleyball`, while rendering lives in
 interface so a differently licensed local detector can replace Ultralytics without
 changing geometry, tracking export, or rendering.
 
-`CameraView.ENDLINE` and `CameraView.SIDELINE` affect only calibration guidance and
-the tactical canvas. The homography always produces the same canonical 9 m × 18 m
-coordinates, so CSV coordinates remain comparable across camera positions.
+`CameraView.ENDLINE` and `CameraView.SIDELINE` select the camera family. `CameraEdge`
+records which canonical edge (`x0`, `x9`, `y0`, or `y18`) is physically closest to
+the camera. These affect only calibration guidance and the tactical canvas. The
+homography always produces the same canonical 9 m × 18 m coordinates, so CSV
+coordinates remain comparable across camera positions.
 
 `examples.volleyball.source` is a narrow input adapter. It resolves a local path or
 downloads one YouTube video, then hands the same ordinary local `Path` to calibration
@@ -230,6 +238,22 @@ In sideline view it is rotated clockwise, with the camera side at the bottom. La
 names and metric coordinates do not rotate: `far_left_corner` is always `(0, 0)`, the
 net is always `y=9`, and `near_right_corner` is always `(9, 18)`.
 
+After fitting, the application projects the two compatible canonical edge midpoints
+into the image. The one lower in the image is resolved as camera-near and is persisted
+as `camera_edge`. If their vertical separation is below 5 pixels, inference is
+ambiguous and calibration stops instead of guessing. Override explicitly when needed:
+
+```text
+--camera-edge x0|x9     with --camera-view sideline
+--camera-edge y0|y18    with --camera-view endline
+--camera-edge auto      infer from the homography (default)
+```
+
+The tactical renderer always puts the resolved camera edge at the bottom. This is a
+display transform only; it never flips or rewrites exported metric coordinates. Use
+`--show-orientation-labels` to draw `CAMERA SIDE`, `FAR SIDE`, and canonical edge
+labels on the tactical video.
+
 For a camera beside the long sideline, use:
 
 ```bash
@@ -282,8 +306,9 @@ python examples/volleyball/main.py \
 On later runs, the existing file passed to `--calibration-file` is loaded without a
 clicking step. Both legacy v1 four-corner files and v2 arbitrary-landmark files are
 accepted; files without `camera_view` default to `endline`, and outputs are saved as
-v2. A supplied `--camera-view` must match the saved value or the command stops with a
-clear error. To process a time slice:
+v2. Files without `camera_edge` infer it from their homography when unambiguous. A
+supplied `--camera-view` must match the saved value or the command stops with a clear
+error. To process a time slice:
 
 ```bash
 python examples/volleyball/main.py \
@@ -334,6 +359,29 @@ empty for these membership-only rows and records `visible`, `occluded`,
 `position_observed`, `visibility_state`, `occlusion_age_frames`, and
 `occlusion_evidence` separately.
 
+Player-player overlap is also occlusion evidence. If two established same-side
+players converge in court space and their image boxes overlap before one detection
+disappears, the missing logical member reserves its slot as `player_overlap`; it is
+not collapsed into the remaining visible player. The same conservative reconnection
+layer handles a later raw-ID change.
+
+### Stable ground-plane positions
+
+The CSV preserves the direct bottom-center/homography result as
+`raw_court_x_m,raw_court_y_m`. Tactical rendering uses the separate stabilized
+`court_x_m,court_y_m` trajectory owned by the logical player. A three-sample rolling
+median followed by a low-latency exponential filter (`alpha=0.45`) reduces box jitter.
+Observations implying more than `10 m/s` by default are retained as raw measurements
+but rejected from the tactical trajectory; configure this with
+`--position-max-speed-mps`.
+
+`position_used`, `position_outlier`, and `position_source` (`observed`, `smoothed`,
+`predicted`, or `held`) make the distinction explicit. `--show-raw-court-points`
+draws small magenta raw markers alongside the stabilized markers for diagnosis.
+Because a homography models the floor plane, a jumping player's airborne feet are not
+a true floor observation. The plausibility gate reduces obvious jump-induced lateral
+artifacts but does not perform 3D pose reconstruction.
+
 Fixed camera obstructions can be described in calibration JSON using image-pixel
 coordinates tied to that camera view:
 
@@ -375,7 +423,8 @@ Every output directory contains:
 
 - `calibration.json` — v2 named correspondences and recomputed fit diagnostics;
 - `player_tracks.csv` — every raw tracked person with frame, timestamp, temporary ID,
-  confidence, box, pixel foot point, metric court point, court/analysis-area flags,
+  confidence, box, pixel foot point, raw and stabilized metric court points,
+  position provenance/outlier flags, court/analysis-area flags,
   canonical `side`, `active_player`, `active_rank`, `active_score`, raw and logical IDs,
   and observed/occluded visibility state;
 - `reconnection_events.jsonl` — one record per accepted raw-ID repair, including

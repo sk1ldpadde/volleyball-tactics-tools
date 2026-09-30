@@ -5,6 +5,7 @@ import numpy as np
 
 from examples.volleyball import main as volleyball_main
 from examples.volleyball.source import ResolvedVideoSource
+from sports.configs.volleyball import CameraEdge
 from examples.volleyball.models import ResolvedPlayerModel
 
 
@@ -45,6 +46,7 @@ def test_pipeline_receives_only_resolved_local_path(tmp_path: Path, monkeypatch)
     calibration = SimpleNamespace(
         save=lambda _path: None,
         configuration=lambda _side, _baseline: object(),
+        camera_edge=CameraEdge.Y18,
     )
     def fake_collect_calibration(_frame, source_video, _config, **_kwargs):
         captured["collection"] = source_video
